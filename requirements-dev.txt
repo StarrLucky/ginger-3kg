@@ -1,0 +1,5 @@
+# Только для разработки и CI. В Docker-образ не попадает.
+-r food_api/requirements.txt
+pytest>=8.0
+httpx>=0.27          # нужен для fastapi.testclient.TestClient
+ruff>=0.6

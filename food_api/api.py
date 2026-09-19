@@ -3,9 +3,9 @@ import os
 import sqlite3
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import List, Literal, Optional
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
@@ -19,6 +19,7 @@ USER_TZ = ZoneInfo(os.getenv("USER_TIMEZONE", "UTC"))
 
 # Nutrient columns mirror Apple HealthKit dietary types so a future
 # Apple Health / Garmin / MyFitnessPal exporter is a plain field copy.
+# fmt: off
 NUTRIENTS = [
     "calories_kcal",     # HKQuantityTypeIdentifierDietaryEnergyConsumed
     "protein_g",         # DietaryProtein
@@ -30,6 +31,7 @@ NUTRIENTS = [
     "sodium_mg",         # DietarySodium
     "caffeine_mg",       # DietaryCaffeine
 ]
+# fmt: on
 MEAL_ORDER = ["breakfast", "lunch", "dinner", "snack"]
 MACRO_KEYS = ["calories_kcal", "protein_g", "fat_total_g", "carbs_g"]
 
@@ -147,14 +149,14 @@ def _check_key(x_api_key: str = Header(...)):
 
 
 def _today() -> str:
-    return datetime.now(timezone.utc).astimezone(USER_TZ).date().isoformat()
+    return datetime.now(UTC).astimezone(USER_TZ).date().isoformat()
 
 
 def _validate_date(value: str) -> str:
     try:
         datetime.strptime(value, "%Y-%m-%d")
     except ValueError:
-        raise HTTPException(400, f"Invalid date '{value}', expected YYYY-MM-DD")
+        raise HTTPException(400, f"Invalid date '{value}', expected YYYY-MM-DD") from None
     return value
 
 
@@ -162,10 +164,10 @@ def _parse_consumed_at(value: str) -> datetime:
     try:
         dt = datetime.fromisoformat(value)
     except ValueError:
-        raise HTTPException(400, f"Invalid consumed_at '{value}', expected ISO 8601")
+        raise HTTPException(400, f"Invalid consumed_at '{value}', expected ISO 8601") from None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=USER_TZ)
-    return dt.astimezone(timezone.utc)
+    return dt.astimezone(UTC)
 
 
 def _item_out(row: sqlite3.Row) -> dict:
@@ -277,7 +279,7 @@ def _day_summary(conn: sqlite3.Connection, day: str) -> dict:
 TARGET_KEYS = ["calories_kcal", "protein_g", "fat_total_g", "carbs_g"]
 
 
-def _get_targets(conn: sqlite3.Connection) -> Optional[dict]:
+def _get_targets(conn: sqlite3.Connection) -> dict | None:
     row = conn.execute("SELECT * FROM targets WHERE id = 1").fetchone()
     if row is None:
         return None
@@ -301,19 +303,19 @@ class FoodItemIn(BaseModel):
 
 
 class TargetsIn(BaseModel):
-    calories_kcal: Optional[float] = Field(None, gt=0)
-    protein_g: Optional[float] = Field(None, gt=0)
-    fat_total_g: Optional[float] = Field(None, gt=0)
-    carbs_g: Optional[float] = Field(None, gt=0)
-    weight_kg: Optional[float] = Field(None, gt=0)
+    calories_kcal: float | None = Field(None, gt=0)
+    protein_g: float | None = Field(None, gt=0)
+    fat_total_g: float | None = Field(None, gt=0)
+    carbs_g: float | None = Field(None, gt=0)
+    weight_kg: float | None = Field(None, gt=0)
 
 
 class FoodLogIn(BaseModel):
-    items: List[FoodItemIn] = Field(..., min_length=1)
+    items: list[FoodItemIn] = Field(..., min_length=1)
     meal_type: Literal["breakfast", "lunch", "dinner", "snack"] = "snack"
     note: str = ""
     source: Literal["text", "voice", "photo"] = "text"
-    consumed_at: Optional[str] = None
+    consumed_at: str | None = None
 
 
 @app.get("/health")
@@ -323,7 +325,7 @@ def health():
 
 @app.post("/logs", dependencies=[Depends(_check_key)])
 def create_log(payload: FoodLogIn):
-    now_utc = datetime.now(timezone.utc)
+    now_utc = datetime.now(UTC)
     consumed = _parse_consumed_at(payload.consumed_at) if payload.consumed_at else now_utc
     log_date = consumed.astimezone(USER_TZ).date().isoformat()
 
@@ -334,8 +336,14 @@ def create_log(payload: FoodLogIn):
             INSERT INTO food_logs (created_at, consumed_at, log_date, meal_type, note, source)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (now_utc.isoformat(), consumed.isoformat(), log_date,
-             payload.meal_type, payload.note, payload.source),
+            (
+                now_utc.isoformat(),
+                consumed.isoformat(),
+                log_date,
+                payload.meal_type,
+                payload.note,
+                payload.source,
+            ),
         )
         log_id = cur.lastrowid
         columns = ", ".join(NUTRIENTS)
@@ -346,8 +354,13 @@ def create_log(payload: FoodLogIn):
                 INSERT INTO food_items (log_id, name, quantity, unit, {columns})
                 VALUES (?, ?, ?, ?, {placeholders})
                 """,
-                (log_id, item.name, item.quantity, item.unit,
-                 *(getattr(item, key) for key in NUTRIENTS)),
+                (
+                    log_id,
+                    item.name,
+                    item.quantity,
+                    item.unit,
+                    *(getattr(item, key) for key in NUTRIENTS),
+                ),
             )
         conn.commit()
         return {
@@ -362,7 +375,7 @@ def create_log(payload: FoodLogIn):
 
 
 @app.get("/day", dependencies=[Depends(_check_key)])
-def get_day(date: Optional[str] = Query(None, description="YYYY-MM-DD, defaults to today")):
+def get_day(date: str | None = Query(None, description="YYYY-MM-DD, defaults to today")):
     day = _validate_date(date) if date else _today()
     conn = _get_db()
     try:
@@ -451,7 +464,7 @@ class ActivityIn(BaseModel):
     duration_min: float = Field(0, ge=0)
     activity_type: str = ""
     note: str = ""
-    performed_at: Optional[str] = None
+    performed_at: str | None = None
 
 
 class GarminActivityIn(BaseModel):
@@ -465,7 +478,7 @@ class GarminActivityIn(BaseModel):
 
 @app.post("/activities", dependencies=[Depends(_check_key)])
 def log_activity(payload: ActivityIn):
-    now_utc = datetime.now(timezone.utc)
+    now_utc = datetime.now(UTC)
     performed = _parse_consumed_at(payload.performed_at) if payload.performed_at else now_utc
     log_date = performed.astimezone(USER_TZ).date().isoformat()
     conn = _get_db()
@@ -477,9 +490,16 @@ def log_activity(payload: ActivityIn):
                  duration_min, calories_kcal, note, source)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manual')
             """,
-            (now_utc.isoformat(), performed.isoformat(), log_date, payload.name,
-             payload.activity_type, payload.duration_min, payload.calories_kcal,
-             payload.note),
+            (
+                now_utc.isoformat(),
+                performed.isoformat(),
+                log_date,
+                payload.name,
+                payload.activity_type,
+                payload.duration_min,
+                payload.calories_kcal,
+                payload.note,
+            ),
         )
         conn.commit()
         return {
@@ -492,8 +512,8 @@ def log_activity(payload: ActivityIn):
 
 
 @app.post("/activities/import", dependencies=[Depends(_check_key)])
-def import_activities(payload: List[GarminActivityIn]):
-    now = datetime.now(timezone.utc).isoformat()
+def import_activities(payload: list[GarminActivityIn]):
+    now = datetime.now(UTC).isoformat()
     imported = skipped = 0
     conn = _get_db()
     try:
@@ -512,10 +532,16 @@ def import_activities(payload: List[GarminActivityIn]):
                      duration_min, calories_kcal, source, external_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?, 'garmin', ?)
                 """,
-                (now, performed.isoformat(),
-                 performed.astimezone(USER_TZ).date().isoformat(),
-                 a.name, a.activity_type, a.duration_min, a.calories_kcal,
-                 a.external_id),
+                (
+                    now,
+                    performed.isoformat(),
+                    performed.astimezone(USER_TZ).date().isoformat(),
+                    a.name,
+                    a.activity_type,
+                    a.duration_min,
+                    a.calories_kcal,
+                    a.external_id,
+                ),
             )
             imported += 1
         conn.commit()
@@ -602,8 +628,8 @@ def export_ack(token: str = Query(..., description="ack_token from /export/pendi
     try:
         datetime.fromisoformat(token)
     except ValueError:
-        raise HTTPException(400, f"Invalid ack token '{token}'")
-    now = datetime.now(timezone.utc).isoformat()
+        raise HTTPException(400, f"Invalid ack token '{token}'") from None
+    now = datetime.now(UTC).isoformat()
     conn = _get_db()
     try:
         cur = conn.execute(
@@ -634,14 +660,16 @@ def search_products(
     query: str = Query(..., min_length=2, description="Product name, ideally with brand"),
     limit: int = Query(5, ge=1, le=10),
 ):
-    params = urllib.parse.urlencode({
-        "search_terms": query,
-        "search_simple": 1,
-        "action": "process",
-        "json": 1,
-        "page_size": limit,
-        "fields": "product_name,brands,quantity,serving_size,nutriments",
-    })
+    params = urllib.parse.urlencode(
+        {
+            "search_terms": query,
+            "search_simple": 1,
+            "action": "process",
+            "json": 1,
+            "page_size": limit,
+            "fields": "product_name,brands,quantity,serving_size,nutriments",
+        }
+    )
     req = urllib.request.Request(
         f"{OFF_SEARCH_URL}?{params}",
         headers={"User-Agent": "MeowFood/1.0 (personal food tracker)"},
@@ -650,7 +678,7 @@ def search_products(
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.load(resp)
     except Exception as exc:
-        raise HTTPException(502, f"Open Food Facts unavailable: {exc}")
+        raise HTTPException(502, f"Open Food Facts unavailable: {exc}") from exc
 
     products = []
     for p in data.get("products", []):
@@ -667,13 +695,15 @@ def search_products(
         }
         if per_100g["calories_kcal"] is None:
             continue
-        products.append({
-            "name": p.get("product_name") or "",
-            "brands": p.get("brands") or "",
-            "package_quantity": p.get("quantity") or "",
-            "serving_size": p.get("serving_size") or "",
-            "per_100g": per_100g,
-        })
+        products.append(
+            {
+                "name": p.get("product_name") or "",
+                "brands": p.get("brands") or "",
+                "package_quantity": p.get("quantity") or "",
+                "serving_size": p.get("serving_size") or "",
+                "per_100g": per_100g,
+            }
+        )
     return {"query": query, "count": len(products), "products": products}
 
 
@@ -681,9 +711,7 @@ def search_products(
 def delete_log(log_id: int):
     conn = _get_db()
     try:
-        row = conn.execute(
-            "SELECT log_date FROM food_logs WHERE id = ?", (log_id,)
-        ).fetchone()
+        row = conn.execute("SELECT log_date FROM food_logs WHERE id = ?", (log_id,)).fetchone()
         if row is None:
             raise HTTPException(404, f"Log {log_id} not found")
         conn.execute("DELETE FROM food_items WHERE log_id = ?", (log_id,))

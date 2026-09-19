@@ -1,0 +1,15 @@
+# Конфигурация инструментов. НЕ переход на packaging:
+# food_api/requirements.txt остаётся источником правды для Dockerfile.
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["food_api/tests"]
+# api.py лежит в food_api/ и не является пакетом — добавляем в путь импорта
+pythonpath = ["food_api"]
+addopts = "-q --strict-markers"

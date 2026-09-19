@@ -1,0 +1,33 @@
+services:
+  food-api:
+    build: .
+    container_name: food-api
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # только для локальной отладки с самого сервера
+      - "127.0.0.1:8010:8000"
+    volumes:
+      - ./data:/app/data
+    networks:
+      - default
+      - gptnet
+
+  garmin-sync:
+    build: ./garmin_sync
+    container_name: garmin-sync
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - FOOD_API_URL=http://food-api:8000
+      - GARMINTOKENS=/app/tokens
+    volumes:
+      - ./garmin_tokens:/app/tokens
+    depends_on:
+      - food-api
+
+# Публичный доступ - через существующий diary-ngrok + gpt-router (Caddy)
+# в ~/diary_api: https://<NGROK_DOMAIN>/food/* -> food-api:8000
+networks:
+  gptnet:
+    external: true

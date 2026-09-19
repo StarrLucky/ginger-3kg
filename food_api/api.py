@@ -3,6 +3,7 @@ import os
 import sqlite3
 import urllib.parse
 import urllib.request
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -11,7 +12,15 @@ from zoneinfo import ZoneInfo
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Meow Food API", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Схема создаётся один раз на старте, а не на каждом запросе."""
+    _init_schema()
+    yield
+
+
+app = FastAPI(title="Meow Food API", version="1.0.0", lifespan=lifespan)
 
 DB_PATH = os.getenv("DB_PATH", "data/food.db")
 API_KEY = os.getenv("FOOD_API_KEY", "")
@@ -125,20 +134,48 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE targets ADD COLUMN weight_kg REAL")
 
 
-def _get_db() -> sqlite3.Connection:
+_SCHEMA = [
+    _CREATE_LOGS,
+    _CREATE_LOGS_INDEX,
+    _CREATE_ITEMS,
+    _CREATE_ITEMS_INDEX,
+    _CREATE_TARGETS,
+    _CREATE_ACTIVITY,
+    _CREATE_ACTIVITY_DATE_INDEX,
+    _CREATE_ACTIVITY_EXT_INDEX,
+]
+
+
+def _connect() -> sqlite3.Connection:
+    """Соединение с БД.
+
+    WAL обязателен: в этот же файл пишет food-api из meow_food, обслуживающий
+    Custom GPT. Без WAL два одновременных INSERT дают "database is locked".
+    journal_mode персистентен для файла, busy_timeout — свойство соединения,
+    поэтому ставится каждый раз.
+    """
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.execute(_CREATE_LOGS)
-    conn.execute(_CREATE_LOGS_INDEX)
-    conn.execute(_CREATE_ITEMS)
-    conn.execute(_CREATE_ITEMS_INDEX)
-    conn.execute(_CREATE_TARGETS)
-    conn.execute(_CREATE_ACTIVITY)
-    conn.execute(_CREATE_ACTIVITY_DATE_INDEX)
-    conn.execute(_CREATE_ACTIVITY_EXT_INDEX)
-    _migrate(conn)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
+
+
+def _init_schema() -> None:
+    """Идемпотентно. Вызывается на старте приложения, не на каждом запросе."""
+    conn = _connect()
+    try:
+        for stmt in _SCHEMA:
+            conn.execute(stmt)
+        _migrate(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _get_db() -> sqlite3.Connection:
+    return _connect()
 
 
 def _check_key(x_api_key: str = Header(...)):

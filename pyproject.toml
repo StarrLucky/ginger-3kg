@@ -13,3 +13,11 @@ testpaths = ["food_api/tests"]
 # api.py лежит в food_api/ и не является пакетом — добавляем в путь импорта
 pythonpath = ["food_api"]
 addopts = "-q --strict-markers"
+filterwarnings = [
+    "error",
+    # Сторонние deprecation-и, на которые мы повлиять не можем — глушим точечно,
+    # чтобы "error" ловил регрессии в нашем коде, а не шум зависимостей.
+    "ignore::DeprecationWarning:anyio.*",
+    "ignore:Using `httpx` with `starlette.testclient`:UserWarning",
+    "default::DeprecationWarning:starlette.*",
+]

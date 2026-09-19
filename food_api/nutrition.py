@@ -1,0 +1,380 @@
+"""Шаг 2 конвейера: питательность из справочников, без участия LLM.
+
+Модель называет еду и оценивает граммовку; числа БЖУ берутся отсюда. Это
+отрезает главный источник галлюцинаций: выдумать значение невозможно, если
+схема ответа модели его не содержит.
+
+Приоритет источников: overrides.json -> Open Food Facts (брендовое) /
+USDA FoodData Central (generic) -> needs_manual. Ненайденное честно
+помечается, а не заполняется нулями под видом данных.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal
+
+import httpx
+
+NUTRIENT_KEYS = [
+    "calories_kcal",
+    "protein_g",
+    "fat_total_g",
+    "fat_saturated_g",
+    "carbs_g",
+    "fiber_g",
+    "sugar_g",
+    "sodium_mg",
+    "caffeine_mg",
+]
+
+USDA_SEARCH_URL = "https://api.nal.usda.gov/fdc/v1/foods/search"
+USDA_DETAIL_URL = "https://api.nal.usda.gov/fdc/v1/food/{fdc_id}"
+OFF_SEARCH_URL = "https://world.openfoodfacts.org/cgi/search.pl"
+USER_AGENT = "MeowFood/1.0 (personal food tracker)"
+
+# nutrientId -> наша колонка. Проверено на живом ответе USDA (SR Legacy 171474).
+# Энергия приходит дважды: 1008 в kcal и 1062 в kJ — берём только kcal.
+# Сахар в части записей лежит под 1063 (Sugars, Total NLEA) вместо 2000.
+USDA_NUTRIENT_IDS: dict[int, str] = {
+    1008: "calories_kcal",
+    1003: "protein_g",
+    1004: "fat_total_g",
+    1258: "fat_saturated_g",
+    1005: "carbs_g",
+    1079: "fiber_g",
+    2000: "sugar_g",
+    1063: "sugar_g",
+    1093: "sodium_mg",
+    1057: "caffeine_mg",
+}
+
+# Единицы, которые умеем переводить в граммы. Для жидкостей берём плотность 1:
+# для молока/кефира/сока погрешность меньше, чем у оценки порции по фото.
+_GRAMS_PER_UNIT: dict[str, float] = {
+    "g": 1.0,
+    "г": 1.0,
+    "gram": 1.0,
+    "grams": 1.0,
+    "грамм": 1.0,
+    "гр": 1.0,
+    "kg": 1000.0,
+    "кг": 1000.0,
+    "ml": 1.0,
+    "мл": 1.0,
+    "l": 1000.0,
+    "л": 1000.0,
+}
+
+
+@dataclass
+class RecognizedItem:
+    """То, что вернула модель: еда и количество, но не питательность."""
+
+    name: str
+    quantity: float
+    unit: str
+    kind: Literal["branded", "generic"] = "generic"
+    lookup_query: str = ""
+    brand: str | None = None
+
+
+@dataclass
+class ResolvedItem:
+    """Позиция с числами и указанием, откуда они взялись."""
+
+    name: str
+    quantity: float
+    unit: str
+    nutrients: dict[str, float] = field(default_factory=dict)
+    source_ref: str = "manual"
+    needs_manual: bool = False
+
+    def to_payload(self) -> dict[str, Any]:
+        """Форма, которую принимает POST /logs (FoodItemIn + служебные поля)."""
+        payload: dict[str, Any] = {
+            "name": self.name,
+            "quantity": self.quantity,
+            "unit": self.unit,
+            "source_ref": self.source_ref,
+            "needs_manual": self.needs_manual,
+        }
+        for key in NUTRIENT_KEYS:
+            payload[key] = round(self.nutrients.get(key, 0.0), 1)
+        return payload
+
+
+def to_grams(quantity: float, unit: str) -> float | None:
+    """Перевод в граммы. None — единица неизвестна (например «шт»).
+
+    Штуки намеренно не угадываем: вес сырника или яблока разнится в разы,
+    и подстановка среднего была бы тем же выдумыванием числа, от которого
+    мы уходим. Такая позиция уходит в needs_manual.
+    """
+    factor = _GRAMS_PER_UNIT.get(unit.strip().lower())
+    return quantity * factor if factor is not None else None
+
+
+def scale_per_100g(per_100g: dict[str, float | None], grams: float) -> dict[str, float]:
+    """per_100g -> абсолютные значения на съеденное количество."""
+    k = grams / 100.0
+    return {key: value * k for key, value in per_100g.items() if isinstance(value, int | float)}
+
+
+# --------------------------------------------------------------------------
+# Кэш
+# --------------------------------------------------------------------------
+
+CREATE_CACHE_TABLE = """
+CREATE TABLE IF NOT EXISTS nutrition_cache (
+    source        TEXT NOT NULL,
+    query         TEXT NOT NULL,
+    per_100g_json TEXT NOT NULL,
+    source_ref    TEXT NOT NULL,
+    fetched_at    REAL NOT NULL,
+    PRIMARY KEY (source, query)
+)
+"""
+
+
+def cache_get(conn: sqlite3.Connection, source: str, query: str) -> tuple[dict, str] | None:
+    row = conn.execute(
+        "SELECT per_100g_json, source_ref FROM nutrition_cache WHERE source = ? AND query = ?",
+        (source, query.lower()),
+    ).fetchone()
+    if row is None:
+        return None
+    return json.loads(row["per_100g_json"]), row["source_ref"]
+
+
+def cache_put(
+    conn: sqlite3.Connection, source: str, query: str, per_100g: dict, source_ref: str
+) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO nutrition_cache"
+        " (source, query, per_100g_json, source_ref, fetched_at) VALUES (?, ?, ?, ?, ?)",
+        (source, query.lower(), json.dumps(per_100g), source_ref, time.time()),
+    )
+    conn.commit()
+
+
+# --------------------------------------------------------------------------
+# Источники
+# --------------------------------------------------------------------------
+
+
+def load_overrides(path: str | Path) -> dict[str, dict]:
+    """Локальная таблица для того, чего в USDA нет или оно названо иначе."""
+    p = Path(path)
+    if not p.exists():
+        return {}
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    # ключи с подчёркиванием — комментарии в самом файле, не продукты
+    return {k.lower(): v for k, v in raw.items() if not k.startswith("_")}
+
+
+def _usda_pick_nutrients(detail: dict) -> dict[str, float]:
+    """foodNutrients детального ответа -> наши колонки (значения на 100 г)."""
+    out: dict[str, float] = {}
+    for entry in detail.get("foodNutrients", []):
+        nutrient = entry.get("nutrient") or {}
+        key = USDA_NUTRIENT_IDS.get(nutrient.get("id"))
+        amount = entry.get("amount")
+        if key is None or not isinstance(amount, int | float):
+            continue
+        # 1008 приходит в kcal, 1062 в kJ — вторая в маппинг не попала,
+        # но подстрахуемся на случай расхождений в данных
+        if key == "calories_kcal" and (nutrient.get("unitName") or "").lower() != "kcal":
+            continue
+        out.setdefault(key, float(amount))
+    return out
+
+
+async def usda_lookup(
+    client: httpx.AsyncClient, query: str, api_key: str
+) -> tuple[dict, str] | None:
+    """Поиск generic-еды в USDA FoodData Central.
+
+    Поиск отдаёт урезанный список нутриентов (у Foundation-записей там нет
+    даже калорий), поэтому по каждому кандидату дозапрашиваем детальную
+    карточку и берём первого, у кого калории реально есть. SR Legacy идёт
+    первым: его панели заполнены полнее, чем у Foundation.
+    """
+    resp = await client.get(
+        USDA_SEARCH_URL,
+        params={
+            "api_key": api_key,
+            "query": query,
+            "dataType": "Foundation,SR Legacy",
+            "pageSize": 5,
+        },
+    )
+    resp.raise_for_status()
+    foods = resp.json().get("foods", [])
+    foods.sort(key=lambda f: 0 if f.get("dataType") == "SR Legacy" else 1)
+
+    for food in foods:
+        fdc_id = food.get("fdcId")
+        if not fdc_id:
+            continue
+        detail_resp = await client.get(
+            USDA_DETAIL_URL.format(fdc_id=fdc_id), params={"api_key": api_key}
+        )
+        if detail_resp.status_code != 200:
+            continue
+        detail = detail_resp.json()
+        per_100g = _usda_pick_nutrients(detail)
+        if "calories_kcal" not in per_100g:
+            continue  # неполная карточка — пробуем следующего кандидата
+        return per_100g, f"USDA {fdc_id} ({detail.get('description', '')})".strip()
+    return None
+
+
+def _off_value(nutriments: dict, key: str, scale: float = 1.0) -> float | None:
+    value = nutriments.get(key)
+    if isinstance(value, int | float):
+        return round(float(value) * scale, 1)
+    return None
+
+
+async def off_lookup(client: httpx.AsyncClient, query: str) -> tuple[dict, str] | None:
+    """Брендовый продукт в Open Food Facts."""
+    resp = await client.get(
+        OFF_SEARCH_URL,
+        params={
+            "search_terms": query,
+            "search_simple": 1,
+            "action": "process",
+            "json": 1,
+            "page_size": 5,
+            "fields": "product_name,brands,nutriments",
+        },
+        headers={"User-Agent": USER_AGENT},
+    )
+    resp.raise_for_status()
+    for product in resp.json().get("products", []):
+        n = product.get("nutriments", {})
+        per_100g = {
+            "calories_kcal": _off_value(n, "energy-kcal_100g"),
+            "protein_g": _off_value(n, "proteins_100g"),
+            "fat_total_g": _off_value(n, "fat_100g"),
+            "fat_saturated_g": _off_value(n, "saturated-fat_100g"),
+            "carbs_g": _off_value(n, "carbohydrates_100g"),
+            "fiber_g": _off_value(n, "fiber_100g"),
+            "sugar_g": _off_value(n, "sugars_100g"),
+            "sodium_mg": _off_value(n, "sodium_100g", scale=1000),  # OFF отдаёт в граммах
+        }
+        if per_100g["calories_kcal"] is None:
+            continue
+        clean = {k: v for k, v in per_100g.items() if v is not None}
+        brand = (product.get("brands") or "").split(",")[0].strip()
+        name = product.get("product_name") or query
+        return clean, f"OFF: {f'{brand} ' if brand else ''}{name}".strip()
+    return None
+
+
+# --------------------------------------------------------------------------
+# Разрешение позиций
+# --------------------------------------------------------------------------
+
+
+async def resolve(
+    items: list[RecognizedItem],
+    conn: sqlite3.Connection,
+    *,
+    overrides: dict[str, dict],
+    usda_api_key: str,
+    client: httpx.AsyncClient,
+) -> list[ResolvedItem]:
+    """Проставить БЖУ каждой позиции из справочников.
+
+    Позиции обрабатываются последовательно: они обычно ходят в один и тот же
+    источник, а кэш делает повторы бесплатными. Параллелить есть смысл только
+    при большом числе новых продуктов в одном приёме пищи.
+    """
+    resolved = []
+    for item in items:
+        resolved.append(
+            await _resolve_one(
+                item, conn, overrides=overrides, usda_api_key=usda_api_key, client=client
+            )
+        )
+    return resolved
+
+
+async def _resolve_one(
+    item: RecognizedItem,
+    conn: sqlite3.Connection,
+    *,
+    overrides: dict[str, dict],
+    usda_api_key: str,
+    client: httpx.AsyncClient,
+) -> ResolvedItem:
+    grams = to_grams(item.quantity, item.unit)
+    query = (item.lookup_query or item.name).strip()
+
+    def manual(reason: str) -> ResolvedItem:
+        return ResolvedItem(
+            name=item.name,
+            quantity=item.quantity,
+            unit=item.unit,
+            nutrients={},
+            source_ref=reason,
+            needs_manual=True,
+        )
+
+    if grams is None:
+        return manual(f"manual: неизвестная единица «{item.unit}»")
+
+    # 1. Локальные переопределения — приоритетнее всего: их правит человек
+    for key in (item.name.lower(), query.lower()):
+        if key in overrides:
+            return ResolvedItem(
+                name=item.name,
+                quantity=item.quantity,
+                unit=item.unit,
+                nutrients=scale_per_100g(overrides[key], grams),
+                source_ref="override",
+            )
+
+    source = "off" if item.kind == "branded" else "usda"
+    off_query = " ".join(filter(None, [item.brand, item.name])) if item.kind == "branded" else query
+    cache_query = off_query if source == "off" else query
+
+    # 2. Кэш: гречка ищется один раз в жизни
+    cached = cache_get(conn, source, cache_query)
+    if cached is not None:
+        per_100g, source_ref = cached
+        return ResolvedItem(
+            name=item.name,
+            quantity=item.quantity,
+            unit=item.unit,
+            nutrients=scale_per_100g(per_100g, grams),
+            source_ref=source_ref,
+        )
+
+    # 3. Внешний справочник
+    try:
+        if source == "off":
+            found = await off_lookup(client, off_query)
+        else:
+            found = await usda_lookup(client, query, usda_api_key)
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        return manual(f"manual: справочник недоступен ({type(exc).__name__})")
+
+    if found is None:
+        return manual("manual: не найдено в справочнике")
+
+    per_100g, source_ref = found
+    cache_put(conn, source, cache_query, per_100g, source_ref)
+    return ResolvedItem(
+        name=item.name,
+        quantity=item.quantity,
+        unit=item.unit,
+        nutrients=scale_per_100g(per_100g, grams),
+        source_ref=source_ref,
+    )

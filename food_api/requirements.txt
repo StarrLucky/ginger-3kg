@@ -1,3 +1,5 @@
 fastapi>=0.110
 uvicorn>=0.29
 tzdata>=2024.1
+httpx>=0.27           # USDA/OFF в nutrition.py и локальная модель в recognize.py
+anthropic>=1.9,<2     # baseline-распознаватель; 1.x тянет httpx2 рядом с httpx

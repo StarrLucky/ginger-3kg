@@ -1,0 +1,36 @@
+# Конфиг gitleaks. Дефолтные правила (AWS, GitHub PAT, OpenAI, Google, приватные
+# ключи и т.д.) включены целиком, сверху — правило под ключи этого проекта.
+title = "ginger-3kg"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "project-env-secret"
+description = "Непустое значение секретной env-переменной проекта"
+regex = '''(?i)\b(FOOD_API_KEY|USDA_API_KEY|ANTHROPIC_API_KEY|GEMINI_API_KEY|GOOGLE_API_KEY|OPENAI_API_KEY|NGROK_AUTHTOKEN)\s*[:=]\s*["']?[A-Za-z0-9_\-./+=]{12,}'''
+keywords = [
+  "food_api_key",
+  "usda_api_key",
+  "anthropic_api_key",
+  "gemini_api_key",
+  "google_api_key",
+  "openai_api_key",
+  "ngrok_authtoken",
+]
+
+# Go RE2 не умеет lookahead, поэтому «значение — это имя переменной, а не секрет»
+# (`usda_api_key=usda_api_key` в вызовах) отсекается здесь. Требуем snake_case
+# с подчёркиванием: настоящий ключ так не выглядит.
+[[rules.allowlists]]
+description = "Передача одноимённого аргумента в коде, а не значение"
+regexTarget = "match"
+regexes = ['''[:=]\s*[a-z]+(_[a-z0-9]+)+\s*$''']
+
+[allowlist]
+description = "Файлы, где такие строки — шаблон или само правило, а не секрет"
+paths = [
+  '''\.gitleaks\.toml$''',
+  '''(^|/)\.env\.example$''',
+  '''scripts/check_secrets\.sh$''',
+]

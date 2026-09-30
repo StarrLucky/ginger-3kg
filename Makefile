@@ -1,4 +1,4 @@
-.PHONY: lint fmt test check
+.PHONY: lint fmt test check secrets hooks
 
 lint:
 	ruff check .
@@ -12,3 +12,10 @@ test:
 	pytest
 
 check: lint test
+
+secrets:
+	./scripts/check_secrets.sh
+
+hooks:
+	git config core.hooksPath scripts/hooks
+	@echo "pre-commit хук включён: scripts/hooks/pre-commit"

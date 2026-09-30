@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Включается командой `make hooks` (git config core.hooksPath scripts/hooks).
+exec "$(git rev-parse --show-toplevel)/scripts/check_secrets.sh" --staged

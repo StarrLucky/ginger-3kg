@@ -134,7 +134,36 @@ ruff check .  →  ruff format --check .  →  pytest
 Без матрицы версий и без публикации покрытия: один рантайм, личный проект, лишний шум не нужен.
 
 Локально то же самое одной командой — `Makefile` с целями `lint` / `test` / `check`.
-Pre-commit-хук не ставим: на личном проекте он чаще мешает, CI поймает.
+Pre-commit-хук для линтера и тестов не ставим: на личном проекте он чаще мешает, CI поймает.
+Для секретов — наоборот, см. §0.7.
+
+### 0.7 Сканирование секретов ✅ сделано
+
+Единственная проверка, которую **нельзя** оставлять только на CI: к моменту, когда джоба
+покраснела, ключ уже в истории и его надо отзывать, а не исправлять. Поэтому две линии:
+
+1. **Pre-commit-хук** — `scripts/hooks/pre-commit`, включается `make hooks`
+   (`git config core.hooksPath scripts/hooks`, а не копия в `.git/hooks` — так хук
+   версионируется вместе с репозиторием). Смотрит только staged-изменения, ~50 мс.
+2. **Джоба `secrets` в CI** — та же проверка по всей истории, `fetch-depth: 0`.
+   Ловит то, что закоммитили с `--no-verify` или до включения хука.
+
+Обе вызывают один `scripts/check_secrets.sh` (`--staged` / `--history`), чтобы локально
+и в CI не разъезжались правила. Скрипт делает две вещи:
+
+- **`.env` под контролем версий** — отдельная проверка по именам файлов, до всякой регулярки.
+  `.env.example`/`.sample`/`.template` разрешены.
+- **`gitleaks`** (в CI пин `8.28.0`, локально `brew install gitleaks`) с `.gitleaks.toml`:
+  дефолтные правила (`useDefault = true`: AWS, GitHub PAT, OpenAI, Google, приватные ключи)
+  плюс своё правило на `FOOD_API_KEY`/`USDA_API_KEY`/`ANTHROPIC_API_KEY`/`GEMINI_API_KEY`.
+
+Замеренная тонкость: своё правило сразу дало ложный позитив на `usda_api_key=usda_api_key`
+(передача одноимённого аргумента в `nutrition.py`). Go RE2 не умеет lookahead, поэтому
+отсекается не регуляркой правила, а `[[rules.allowlists]]` с `regexTarget = "match"`:
+значение вида snake_case с подчёркиванием — это имя переменной, настоящий ключ так не выглядит.
+
+Проверено вживую: коммит с `ANTHROPIC_API_KEY = "sk-ant-..."` и коммит с `.env` блокируются,
+история репозитория чистая.
 
 ### 0.6 Чего НЕ делаем
 
@@ -346,6 +375,7 @@ ngrok на бесплатном тарифе показывает **заглуш
 ## Файлы
 
 **Новые:** `pyproject.toml`, `requirements-dev.txt`, `Makefile`, `.github/workflows/ci.yml`,
+`.gitleaks.toml`, `scripts/check_secrets.sh`, `scripts/hooks/pre-commit`,
 `food_api/tests/` (6 файлов Фазы 0 + 3 из Фаз 1–2), `food_api/recognize.py`,
 `food_api/nutrition.py`, `food_api/recognize_prompt.md`, `food_api/overrides.json`,
 `food_api/eval/run_eval.py`, каталог `webapp/` (7 файлов из таблицы выше).
@@ -358,6 +388,8 @@ ngrok на бесплатном тарифе показывает **заглуш
 ## Проверка
 
 0. `make check` (= `ruff check . && ruff format --check . && pytest`) — зелёное локально и в CI.
+   `make hooks` один раз на свежем клоне — иначе pre-commit-сканер секретов не включён.
+   `make secrets` — сканирование всей истории (нужен `gitleaks`).
    Тесты Фазы 0 должны проходить на **неизменённом** `api.py` до начала Фазы 1: это доказывает,
    что они фиксируют текущее поведение, а не подогнаны под новый код.
 1. Локально: `RECOGNIZE_PROVIDER=anthropic ANTHROPIC_API_KEY=... FOOD_API_KEY=dev uvicorn api:app --reload`,

@@ -4,6 +4,7 @@
 поэтому проверяем логику приоритетов и арифметику, а не доступность USDA.
 """
 
+import asyncio
 import json
 
 import httpx
@@ -273,6 +274,32 @@ async def test_second_lookup_hits_cache(conn):
     assert len(handler.calls) == first, "второй раз в сеть ходить не надо"
     assert res.nutrients["calories_kcal"] == pytest.approx(171.5)  # 343 * 0.5
     assert res.source_ref.startswith("USDA 170286")
+
+
+async def test_items_are_resolved_in_parallel(conn):
+    """Позиции в одном приёме пищи не должны ждать друг друга.
+
+    Четыре новых продукта — это восемь запросов к справочнику. Последовательно
+    они складываются в секунды поверх и без того долгого вызова модели.
+    """
+    inflight = 0
+    peak = 0
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal inflight, peak
+        inflight += 1
+        peak = max(peak, inflight)
+        await asyncio.sleep(0.01)
+        inflight -= 1
+        return httpx.Response(200, json={"foods": []})
+
+    items = [
+        item(name=name, lookup_query=name) for name in ("buckwheat", "chicken", "salad", "bread")
+    ]
+    async with mock_client(handle) as client:
+        await nut.resolve(items, conn, overrides={}, usda_api_key="k", client=client)
+
+    assert peak >= 2, f"запросы шли по одному (пик {peak}) — resolve стал последовательным"
 
 
 # --- Open Food Facts -------------------------------------------------------

@@ -5,7 +5,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY api.py .
+# Все модули приложения, а не только api.py: он импортирует nutrition и
+# recognize на уровне модуля, а те читают recognize_prompt.md и overrides.json.
+COPY api.py nutrition.py recognize.py recognize_prompt.md overrides.json ./
 
 RUN mkdir -p /app/data
 

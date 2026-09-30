@@ -9,15 +9,31 @@ from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo
 
+import httpx
+import nutrition as nut
+import recognize as rec
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI):
-    """Схема создаётся один раз на старте, а не на каждом запросе."""
+async def lifespan(app: FastAPI):
+    """Схема создаётся один раз на старте, а не на каждом запросе.
+
+    Здесь же живут долгоживущие ресурсы шага распознавания: httpx-клиент под
+    лукапы в справочники и сам распознаватель. Оба закрываются на выходе —
+    иначе asyncio ругается на брошенные соединения при остановке.
+    """
     _init_schema()
-    yield
+    app.state.http = httpx.AsyncClient(timeout=LOOKUP_TIMEOUT)
+    app.state.overrides = nut.load_overrides(OVERRIDES_PATH)
+    app.state.recognizer = None
+    try:
+        yield
+    finally:
+        await app.state.http.aclose()
+        if app.state.recognizer is not None:
+            await app.state.recognizer.aclose()
 
 
 app = FastAPI(title="Meow Food API", version="1.0.0", lifespan=lifespan)
@@ -25,6 +41,11 @@ app = FastAPI(title="Meow Food API", version="1.0.0", lifespan=lifespan)
 DB_PATH = os.getenv("DB_PATH", "data/food.db")
 API_KEY = os.getenv("FOOD_API_KEY", "")
 USER_TZ = ZoneInfo(os.getenv("USER_TIMEZONE", "UTC"))
+USDA_API_KEY = os.getenv("USDA_API_KEY", "")
+OVERRIDES_PATH = Path(__file__).parent / "overrides.json"
+# Лукап в справочник — два коротких запроса подряд; если USDA молчит полминуты,
+# ждать её дольше смысла нет, позиция всё равно уйдёт в needs_manual.
+LOOKUP_TIMEOUT = 30.0
 
 # Nutrient columns mirror Apple HealthKit dietary types so a future
 # Apple Health / Garmin / MyFitnessPal exporter is a plain field copy.
@@ -143,6 +164,7 @@ _SCHEMA = [
     _CREATE_ACTIVITY,
     _CREATE_ACTIVITY_DATE_INDEX,
     _CREATE_ACTIVITY_EXT_INDEX,
+    nut.CREATE_CACHE_TABLE,
 ]
 
 
@@ -409,6 +431,95 @@ def create_log(payload: FoodLogIn):
         }
     finally:
         conn.close()
+
+
+class RecognizeIn(BaseModel):
+    text: str | None = None
+    image_b64: str | None = None
+    media_type: str = "image/jpeg"
+    # Если пользователь сам выбрал приём пищи — его выбор важнее догадки модели.
+    meal_type: Literal["breakfast", "lunch", "dinner", "snack"] | None = None
+    consumed_at: str | None = None
+
+
+def _get_recognizer() -> rec.Recognizer:
+    """Собрать распознаватель при первом обращении, а не на старте.
+
+    Ошибка в RECOGNIZE_PROVIDER не должна ронять приложение целиком: в эту же
+    базу через /logs и /day ходит Custom GPT, которому распознавание не нужно.
+    Плохая конфигурация превращается в 503 на одном эндпоинте, а не в
+    недоступность всего сервиса.
+    """
+    if app.state.recognizer is None:
+        try:
+            app.state.recognizer = rec.build_recognizer()
+        except ValueError as exc:
+            raise HTTPException(503, f"Recognition is not configured: {exc}") from None
+    return app.state.recognizer
+
+
+@app.post("/recognize", dependencies=[Depends(_check_key)])
+async def recognize_meal(payload: RecognizeIn):
+    """Распознать еду и проставить БЖУ. Ничего не сохраняет.
+
+    Возвращает черновик в форме, которую принимает POST /logs: отправляет его
+    человек, после того как посмотрел. Позиции с needs_manual — там, где
+    справочник промолчал; нулей под видом данных в ответе нет.
+
+    Хендлер async, а не sync: вызов модели занимает 5-20 с, и синхронный занял
+    бы воркер из общего пула — ровно та проблема, которую MULTIUSER.md §1
+    отмечает для пятнадцатисекундного /products.
+    """
+    if not payload.text and not payload.image_b64:
+        raise HTTPException(400, "Need text or image_b64")
+    if payload.image_b64 and len(payload.image_b64) > rec.MAX_IMAGE_B64_CHARS:
+        raise HTTPException(
+            413,
+            f"Image is {len(payload.image_b64)} base64 chars,"
+            f" limit is {rec.MAX_IMAGE_B64_CHARS}. Downscale before sending.",
+        )
+
+    consumed = _parse_consumed_at(payload.consumed_at) if payload.consumed_at else datetime.now(UTC)
+    recognizer = _get_recognizer()
+
+    try:
+        meal = await recognizer.recognize(
+            text=payload.text,
+            image_b64=payload.image_b64,
+            media_type=payload.media_type,
+            now=consumed.astimezone(USER_TZ).isoformat(),
+        )
+    except rec.RecognizeError as exc:
+        # 502, а не 500: отказал апстрим, а не мы. Клиенту стоит повторить.
+        raise HTTPException(502, f"Recognition failed: {exc}") from None
+
+    # Соединение синхронное и живёт через await'ы лукапов. Запросы к нему
+    # короткие и локальные (кэш), event loop они держат на микросекунды.
+    conn = _get_db()
+    try:
+        resolved = await nut.resolve(
+            meal.to_items(),
+            conn,
+            overrides=app.state.overrides,
+            usda_api_key=USDA_API_KEY,
+            client=app.state.http,
+        )
+    finally:
+        conn.close()
+
+    items = [item.to_payload() for item in resolved]
+    return {
+        "draft": {
+            "items": items,
+            "meal_type": payload.meal_type or meal.meal_type,
+            "note": meal.notes,
+            "source": "photo" if payload.image_b64 else "text",
+            "consumed_at": consumed.isoformat(),
+        },
+        "confidence": meal.confidence,
+        "needs_manual": any(item["needs_manual"] for item in items),
+        "provider": recognizer.name,
+    }
 
 
 @app.get("/day", dependencies=[Depends(_check_key)])

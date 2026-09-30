@@ -11,6 +11,7 @@ USDA FoodData Central (generic) -> needs_manual. Ненайденное чест
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import time
@@ -292,18 +293,26 @@ async def resolve(
 ) -> list[ResolvedItem]:
     """Проставить БЖУ каждой позиции из справочников.
 
-    Позиции обрабатываются последовательно: они обычно ходят в один и тот же
-    источник, а кэш делает повторы бесплатными. Параллелить есть смысл только
-    при большом числе новых продуктов в одном приёме пищи.
+    Позиции обрабатываются параллельно. Внутри одного приёма пищи они обычно
+    разные («гречка», «куриная грудка», «салат»), и каждая — это два запроса
+    к справочнику подряд: поиск и карточка. Последовательно четыре новых
+    позиции складываются в 4-8 с поверх и без того долгого вызова модели.
+
+    Две позиции с одинаковым запросом оба раза промахнутся мимо кэша и сходят
+    в сеть дважды — это допущено сознательно: `cache_put` идемпотентен
+    (INSERT OR REPLACE), а совпадающие позиции в одном приёме пищи редки.
+    Заводить реестр запросов в полёте ради этого случая дороже, чем он стоит.
     """
-    resolved = []
-    for item in items:
-        resolved.append(
-            await _resolve_one(
-                item, conn, overrides=overrides, usda_api_key=usda_api_key, client=client
+    return list(
+        await asyncio.gather(
+            *(
+                _resolve_one(
+                    item, conn, overrides=overrides, usda_api_key=usda_api_key, client=client
+                )
+                for item in items
             )
         )
-    return resolved
+    )
 
 
 async def _resolve_one(

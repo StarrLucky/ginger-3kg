@@ -5,13 +5,34 @@
 // другой (/food/app/), поэтому база вычисляется, а не зашивается.
 export const API_BASE = new URL('..', document.baseURI).href;
 
+/** FastAPI отдаёт detail строкой у HTTPException и СПИСКОМ объектов у 422.
+    Без этого список превращался в «[object Object]» прямо на экране. */
+function describe(detail, status) {
+  if (typeof detail === 'string' && detail) return detail;
+  if (Array.isArray(detail) && detail.length) {
+    const first = detail[0];
+    const field = Array.isArray(first?.loc) ? first.loc[first.loc.length - 1] : null;
+    const msg = first?.msg || 'неверное значение';
+    return field ? `Поле «${field}»: ${msg}` : msg;
+  }
+  return `HTTP ${status}`;
+}
+
 export class ApiError extends Error {
   constructor(status, detail) {
-    super(detail || `HTTP ${status}`);
+    super(describe(detail, status));
     this.status = status;
     this.detail = detail;
   }
 }
+
+/* Что делать, когда сессия перестала приниматься. Ставится из app.js:
+   иначе каждый вызывающий ловил бы 401 сам, и любой пропуск оставлял бы
+   пользователя на мёртвом экране без формы входа. */
+let onUnauthorized = () => {};
+export const setUnauthorizedHandler = (fn) => {
+  onUnauthorized = fn;
+};
 
 async function request(path, { method = 'GET', body, timeoutMs = 20000 } = {}) {
   const controller = new AbortController();
@@ -44,7 +65,11 @@ async function request(path, { method = 'GET', body, timeoutMs = 20000 } = {}) {
     if (resp.ok) throw new ApiError(resp.status, 'Сервер вернул не JSON');
   }
 
-  if (!resp.ok) throw new ApiError(resp.status, data?.detail);
+  if (!resp.ok) {
+    // Вход и проверка статуса сами разбираются с 401 — для них это штатный ответ.
+    if (resp.status === 401 && !path.startsWith('auth/')) onUnauthorized();
+    throw new ApiError(resp.status, data?.detail);
+  }
   return data;
 }
 
@@ -54,7 +79,6 @@ export const authStatus = () => request('auth/status');
 
 export const day = (date) => request(date ? `day?date=${encodeURIComponent(date)}` : 'day');
 export const saveLog = (draft) => request('logs', { method: 'POST', body: draft });
-export const deleteLog = (logId) => request(`logs/${logId}`, { method: 'DELETE' });
 
 // Pi + туннель + модель дают 5-20 с; двадцатисекундного таймаута тут мало.
 export const recognize = (payload) =>

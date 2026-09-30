@@ -31,6 +31,15 @@ function showApp(signedIn) {
   $('app').hidden = !signedIn;
 }
 
+// Сессия могла умереть в любой момент: истёк срок, отозвали с другого
+// устройства, браузер выбросил куку. Без этого пользователь оставался на
+// рабочем экране с сообщением об ошибке и без способа войти заново.
+api.setUnauthorizedHandler(() => {
+  state.draft = null;
+  showApp(false);
+  say($('login-error'), 'Сессия истекла — войди заново', 'error');
+});
+
 function say(node, text, kind = 'hint') {
   node.textContent = text;
   node.className = kind;
@@ -143,6 +152,14 @@ function draftProblem() {
     if (!String(item.name).trim()) return 'У позиции пустое название';
     if (!(Number(item.quantity) > 0)) return `Укажи количество для «${item.name}»`;
     if (!String(item.unit).trim()) return `Укажи единицу для «${item.name}»`;
+    // POST /logs требует все четыре макроса числами; отрицательные он тоже
+    // не примет. Ловим здесь, пока понятно, какая строка виновата.
+    for (const key of ['calories_kcal', 'protein_g', 'fat_total_g', 'carbs_g']) {
+      const value = Number(item[key]);
+      if (!Number.isFinite(value) || value < 0) {
+        return `Проверь числа в позиции «${item.name}»`;
+      }
+    }
   }
   return '';
 }

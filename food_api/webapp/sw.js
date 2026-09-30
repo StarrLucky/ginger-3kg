@@ -42,19 +42,34 @@ self.addEventListener('fetch', (event) => {
 
   if (event.request.method !== 'GET' || !inScope) return;
 
+  // stale-while-revalidate, а не cache-first.
+  //
+  // При cache-first обновление не доезжало бы до телефона никогда: браузер
+  // переустанавливает воркер, только когда меняется сам sw.js, а VERSION
+  // зашита в исходник, и ничто в Makefile или CI её не поднимает. Выкатил
+  // исправление — устройство, которому оно нужнее всего, продолжает жить на
+  // старой оболочке. Здесь кэш отдаётся мгновенно, а обновление подтягивается
+  // в фоне и применяется со следующего открытия.
   event.respondWith(
-    caches.match(event.request).then(
-      (hit) =>
-        hit ||
-        fetch(event.request).then((resp) => {
-          // Кладём в кэш только успешные ответы своего происхождения:
-          // подсунуть в оболочку 404 или ответ редиректа — хуже, чем не кэшировать.
-          if (resp.ok && resp.type === 'basic') {
-            const copy = resp.clone();
-            caches.open(CACHE).then((c) => c.put(event.request, copy));
-          }
+    caches.open(CACHE).then(async (cache) => {
+      const cached = await cache.match(event.request);
+      const fresh = fetch(event.request)
+        .then((resp) => {
+          // Кладём только успешные ответы своего происхождения: подсунуть в
+          // оболочку 404 или ответ редиректа — хуже, чем не кэшировать.
+          if (resp.ok && resp.type === 'basic') cache.put(event.request, resp.clone());
           return resp;
-        }),
-    ),
+        })
+        .catch(() => null);
+
+      if (cached) {
+        event.waitUntil(fresh);
+        return cached;
+      }
+      return (
+        (await fresh) ||
+        new Response('Нет связи и нет копии в кэше', { status: 504, statusText: 'Offline' })
+      );
+    }),
   );
 });

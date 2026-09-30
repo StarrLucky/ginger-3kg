@@ -4,6 +4,8 @@
 Кука добавлена рядом, а не вместо.
 """
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from conftest import API_KEY
 from fastapi.testclient import TestClient
@@ -104,7 +106,11 @@ def test_revoked_token_stays_dead_when_replayed(anon):
 # --- флаги куки --------------------------------------------------------------
 
 
-def test_cookie_flags_protect_it(api):
+def test_cookie_flags_protect_it(api, monkeypatch):
+    # Явно, а не из окружения: .env.example советует COOKIE_SECURE=0 для
+    # локальной отладки, и экспортировавший его получал бы красный тест,
+    # не имеющий отношения к его правке.
+    monkeypatch.setattr(api, "COOKIE_SECURE", True)
     with TestClient(api.app) as c:
         raw = login(c).headers["set-cookie"]
 
@@ -139,3 +145,99 @@ def test_auth_status_reports_the_session(anon):
     assert anon.get("/auth/status").status_code == 401
     login(anon)
     assert anon.get("/auth/status").status_code == 200
+
+
+# --- срок жизни и чистка -----------------------------------------------------
+
+
+def stale_session(api, token: str, days_ago: int) -> None:
+    """Положить в базу сессию с давним created_at."""
+    conn = api._get_db()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions (token, created_at) VALUES (?, ?)",
+            (token, (datetime.now(UTC) - timedelta(days=days_ago)).isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_expired_session_is_rejected(anon, insecure_cookies):
+    """max-age — просьба к браузеру, а не ограничение.
+
+    Токен, снятый с устройства, без проверки на сервере жил бы вечно.
+    """
+    stale_session(insecure_cookies, "old-token", days_ago=400)
+    anon.cookies.set("session", "old-token")
+    assert anon.get("/day").status_code == 401
+
+
+def test_fresh_session_within_the_window_still_works(anon, insecure_cookies):
+    stale_session(insecure_cookies, "recent-token", days_ago=10)
+    anon.cookies.set("session", "recent-token")
+    assert anon.get("/day").status_code == 200
+
+
+def test_login_prunes_expired_sessions(anon, insecure_cookies):
+    """Таблица лежит в базе, общей с food-api из meow_food: расти ей незачем."""
+    stale_session(insecure_cookies, "old-token", days_ago=400)
+    login(anon)
+
+    conn = insecure_cookies._get_db()
+    try:
+        rows = conn.execute("SELECT token FROM sessions").fetchall()
+    finally:
+        conn.close()
+    tokens = {row["token"] for row in rows}
+    assert "old-token" not in tokens, "просроченная сессия должна быть удалена"
+    assert len(tokens) == 1, "осталась ровно новая"
+
+
+# --- ограничение подбора -----------------------------------------------------
+
+
+def test_login_locks_out_after_repeated_failures(anon):
+    """Вход достижим из любого браузера через туннель; без счётчика ключ
+    подбирают без ограничений по скорости."""
+    for _ in range(5):
+        assert login(anon, "wrong").status_code == 401
+
+    resp = login(anon, "wrong")
+    assert resp.status_code == 429
+    assert "try again" in resp.json()["detail"]
+
+
+def test_lockout_applies_to_the_right_key_too(anon):
+    """Иначе блокировка обходится подстановкой верного ключа на шестой попытке."""
+    for _ in range(5):
+        login(anon, "wrong")
+    assert login(anon).status_code == 429
+
+
+def test_successful_login_clears_the_counter(anon):
+    for _ in range(4):
+        login(anon, "wrong")
+    assert login(anon).status_code == 200
+
+    for _ in range(4):
+        assert login(anon, "wrong").status_code == 401, "счётчик должен был обнулиться"
+
+
+# --- имя куки ----------------------------------------------------------------
+
+
+def test_cookie_name_is_the_same_on_write_and_read(anon, insecure_cookies):
+    """Константа должна быть нагруженной с обеих сторон.
+
+    Читалась бы кука по имени параметра, а писалась по константе — и
+    переименование давало бы молча мёртвые сессии при каждом входе.
+    """
+    name = insecure_cookies.SESSION_COOKIE
+    raw = login(anon).headers["set-cookie"]
+    assert raw.startswith(f"{name}="), raw
+
+    token = anon.cookies[name]
+    with TestClient(insecure_cookies.app) as fresh:
+        fresh.cookies.set(name, token)
+        assert fresh.get("/day").status_code == 200

@@ -36,10 +36,13 @@ const num = (value, digits = 1) =>
 export function renderDay(day) {
   const root = el('div', 'day');
 
-  if (day.progress) {
+  // Итоги — всегда. Раньше они подменялись полосами прогресса, и при цели,
+  // заданной не по всем макросам, соответствующие цифры пропадали с экрана
+  // совсем. Крайний случай: заданный один лишь weight_kg даёт progress: {} —
+  // пустой объект, в JS истинный, — и день оставался вообще без чисел.
+  root.append(renderTotals(day.totals));
+  if (day.progress && Object.keys(day.progress).length) {
     root.append(renderProgress(day));
-  } else {
-    root.append(renderTotals(day.totals));
   }
 
   if (!day.meals.length) {
@@ -196,7 +199,10 @@ function renderDraftItem(item, index, draft, onChange) {
     input.step = digits ? '0.1' : '1';
     input.value = item[key] ?? 0;
     input.addEventListener('input', () => {
-      item[key] = input.value === '' ? '' : Number(input.value);
+      // Пустое поле — это ноль, а не пустая строка: '' доезжала до POST /logs
+      // и получала 422 на обязательном float, который пользователю нечем
+      // истолковать.
+      item[key] = Number(input.value) || 0;
       repaint();
       onChange();
     });

@@ -2,10 +2,11 @@ import json
 import os
 import secrets
 import sqlite3
+import time
 import urllib.parse
 import urllib.request
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo
@@ -13,7 +14,16 @@ from zoneinfo import ZoneInfo
 import httpx
 import nutrition as nut
 import recognize as rec
-from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Response
+from fastapi import (
+    Cookie,
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -54,6 +64,11 @@ LOOKUP_TIMEOUT = 30.0
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "1") != "0"
 SESSION_COOKIE = "session"
 SESSION_MAX_AGE = 365 * 24 * 60 * 60
+# Неудачные попытки входа на один адрес до временной блокировки. Вход теперь
+# достижим из любого браузера через туннель, а вся защита держится на энтропии
+# FOOD_API_KEY — без счётчика её подбирают без ограничений по скорости.
+LOGIN_MAX_FAILURES = 5
+LOGIN_LOCKOUT_SECONDS = 300
 
 # Nutrient columns mirror Apple HealthKit dietary types so a future
 # Apple Health / Garmin / MyFitnessPal exporter is a plain field copy.
@@ -228,9 +243,18 @@ def _same(presented: str, expected: str) -> bool:
 
 
 def _session_exists(token: str) -> bool:
+    """Живая ли сессия.
+
+    Срок проверяется на сервере, а не только через max-age куки: max-age —
+    это просьба к браузеру, а не ограничение. Токен, снятый с устройства,
+    иначе оставался бы действительным вечно.
+    """
+    cutoff = (datetime.now(UTC) - timedelta(seconds=SESSION_MAX_AGE)).isoformat()
     conn = _get_db()
     try:
-        row = conn.execute("SELECT 1 FROM sessions WHERE token = ?", (token,)).fetchone()
+        row = conn.execute(
+            "SELECT 1 FROM sessions WHERE token = ? AND created_at > ?", (token, cutoff)
+        ).fetchone()
         return row is not None
     finally:
         conn.close()
@@ -238,7 +262,10 @@ def _session_exists(token: str) -> bool:
 
 def _check_key(
     x_api_key: str | None = Header(None),
-    session: str | None = Cookie(None),
+    # alias, а не имя параметра: иначе переименование SESSION_COOKIE меняло бы
+    # только запись куки, а читалась бы она по-прежнему как "session" — и
+    # каждый вход молча создавал бы мёртвую сессию.
+    session: str | None = Cookie(None, alias=SESSION_COOKIE),
 ):
     """Заголовок или кука сессии.
 
@@ -433,8 +460,31 @@ class LoginIn(BaseModel):
     key: str
 
 
+# Счётчик в памяти процесса, а не в базе: перезапуск сбрасывает его, и это
+# приемлемо — защита здесь от перебора, а не от терпеливого противника.
+# Ключ — адрес клиента, значение — (число неудач, время последней).
+_login_failures: dict[str, tuple[int, float]] = {}
+
+
+def _login_blocked(client: str) -> int:
+    """Сколько секунд осталось ждать. 0 — можно пробовать."""
+    failures, last = _login_failures.get(client, (0, 0.0))
+    if failures < LOGIN_MAX_FAILURES:
+        return 0
+    left = LOGIN_LOCKOUT_SECONDS - (time.monotonic() - last)
+    if left <= 0:
+        _login_failures.pop(client, None)
+        return 0
+    return int(left) + 1
+
+
+def _note_login_failure(client: str) -> None:
+    failures, _ = _login_failures.get(client, (0, 0.0))
+    _login_failures[client] = (failures + 1, time.monotonic())
+
+
 @app.post("/auth/login")
-def login(payload: LoginIn, response: Response):
+def login(payload: LoginIn, response: Response, request: Request):
     """Обменять ключ на куку сессии.
 
     В куке лежит случайный токен, а не сам FOOD_API_KEY. Разница практическая:
@@ -444,12 +494,24 @@ def login(payload: LoginIn, response: Response):
     """
     if not API_KEY:
         raise HTTPException(500, "API key not configured on server")
+
+    client = request.client.host if request.client else "unknown"
+    wait = _login_blocked(client)
+    if wait:
+        raise HTTPException(429, f"Too many attempts, try again in {wait}s")
+
     if not _same(payload.key, API_KEY):
+        _note_login_failure(client)
         raise HTTPException(401, "Invalid API key")
+    _login_failures.pop(client, None)
 
     token = secrets.token_urlsafe(32)
     conn = _get_db()
     try:
+        conn.execute(
+            "DELETE FROM sessions WHERE created_at <= ?",
+            ((datetime.now(UTC) - timedelta(seconds=SESSION_MAX_AGE)).isoformat(),),
+        )
         conn.execute(
             "INSERT INTO sessions (token, created_at) VALUES (?, ?)",
             (token, datetime.now(UTC).isoformat()),
@@ -471,7 +533,7 @@ def login(payload: LoginIn, response: Response):
 
 
 @app.post("/auth/logout")
-def logout(response: Response, session: str | None = Cookie(None)):
+def logout(response: Response, session: str | None = Cookie(None, alias=SESSION_COOKIE)):
     """Отозвать сессию. Без куки — не ошибка: выход и так состоялся."""
     if session is not None:
         conn = _get_db()

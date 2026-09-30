@@ -29,6 +29,20 @@ def no_network(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", _boom)
 
 
+@pytest.fixture(autouse=True)
+def fresh_login_counter():
+    """Счётчик неудачных входов живёт в памяти процесса, а не в БД.
+
+    Без сброса неудачи одного теста дотекают до следующего и он падает
+    на 429 по чужой вине.
+    """
+    import api as api_module
+
+    api_module._login_failures.clear()
+    yield
+    api_module._login_failures.clear()
+
+
 @pytest.fixture
 def api(tmp_path, monkeypatch):
     """Модуль api с изолированной БД и известным ключом."""

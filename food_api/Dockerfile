@@ -9,6 +9,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # recognize на уровне модуля, а те читают recognize_prompt.md и overrides.json.
 COPY api.py nutrition.py recognize.py recognize_prompt.md overrides.json ./
 COPY webapp/ ./webapp/
+# Тесты фронтенда в образ не нужны
+RUN rm -rf ./webapp/tests
 
 RUN mkdir -p /app/data
 

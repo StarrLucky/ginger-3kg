@@ -1,5 +1,6 @@
 import json
 import os
+import secrets
 import sqlite3
 import urllib.parse
 import urllib.request
@@ -12,7 +13,7 @@ from zoneinfo import ZoneInfo
 import httpx
 import nutrition as nut
 import recognize as rec
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 
@@ -46,6 +47,11 @@ OVERRIDES_PATH = Path(__file__).parent / "overrides.json"
 # Лукап в справочник — два коротких запроса подряд; если USDA молчит полминуты,
 # ждать её дольше смысла нет, позиция всё равно уйдёт в needs_manual.
 LOOKUP_TIMEOUT = 30.0
+# Кука сессии для webapp. Secure по умолчанию; выключается только для локальной
+# отладки по http, где браузер Secure-куку просто не сохранит.
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "1") != "0"
+SESSION_COOKIE = "session"
+SESSION_MAX_AGE = 365 * 24 * 60 * 60
 
 # Nutrient columns mirror Apple HealthKit dietary types so a future
 # Apple Health / Garmin / MyFitnessPal exporter is a plain field copy.
@@ -108,6 +114,13 @@ CREATE INDEX IF NOT EXISTS idx_items_log
 ON food_items(log_id)
 """
 
+_CREATE_SESSIONS = """
+CREATE TABLE IF NOT EXISTS sessions (
+    token      TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL
+)
+"""
+
 _CREATE_TARGETS = """
 CREATE TABLE IF NOT EXISTS targets (
     id            INTEGER PRIMARY KEY CHECK (id = 1),
@@ -161,6 +174,7 @@ _SCHEMA = [
     _CREATE_ITEMS,
     _CREATE_ITEMS_INDEX,
     _CREATE_TARGETS,
+    _CREATE_SESSIONS,
     _CREATE_ACTIVITY,
     _CREATE_ACTIVITY_DATE_INDEX,
     _CREATE_ACTIVITY_EXT_INDEX,
@@ -200,11 +214,47 @@ def _get_db() -> sqlite3.Connection:
     return _connect()
 
 
-def _check_key(x_api_key: str = Header(...)):
+def _same(presented: str, expected: str) -> bool:
+    """Сравнение за постоянное время.
+
+    Обычное `!=` выходит на первом различающемся байте, и время ответа
+    подсказывает, сколько символов угадано. Пока ключ жил только в заголовке
+    от Shortcut, это было теоретизированием; с кукой поверхность стала
+    браузерной, и экономить тут больше не на чем.
+    """
+    return secrets.compare_digest(presented.encode("utf-8"), expected.encode("utf-8"))
+
+
+def _session_exists(token: str) -> bool:
+    conn = _get_db()
+    try:
+        row = conn.execute("SELECT 1 FROM sessions WHERE token = ?", (token,)).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def _check_key(
+    x_api_key: str | None = Header(None),
+    session: str | None = Cookie(None),
+):
+    """Заголовок или кука сессии.
+
+    Заголовок остаётся ровно тем же, что был, — Shortcut и garmin-sync не
+    замечают изменения. Кука добавлена для webapp: положить ключ в localStorage
+    нельзя, Safari чистит script-writable storage при простое.
+    """
     if not API_KEY:
         raise HTTPException(500, "API key not configured on server")
-    if x_api_key != API_KEY:
-        raise HTTPException(401, "Invalid API key")
+    if x_api_key is not None:
+        if not _same(x_api_key, API_KEY):
+            raise HTTPException(401, "Invalid API key")
+        return
+    if session is not None:
+        if not _session_exists(session):
+            raise HTTPException(401, "Session expired or revoked")
+        return
+    raise HTTPException(401, "Provide the X-API-Key header or sign in")
 
 
 def _today() -> str:
@@ -375,6 +425,67 @@ class FoodLogIn(BaseModel):
     note: str = ""
     source: Literal["text", "voice", "photo"] = "text"
     consumed_at: str | None = None
+
+
+class LoginIn(BaseModel):
+    key: str
+
+
+@app.post("/auth/login")
+def login(payload: LoginIn, response: Response):
+    """Обменять ключ на куку сессии.
+
+    В куке лежит случайный токен, а не сам FOOD_API_KEY. Разница практическая:
+    утёкшую куку можно отозвать через /auth/logout, не трогая ключ, которым
+    ходят Shortcut и garmin-sync. Положи мы в куку ключ — отзыв означал бы
+    ротацию ключа и поломку обоих.
+    """
+    if not API_KEY:
+        raise HTTPException(500, "API key not configured on server")
+    if not _same(payload.key, API_KEY):
+        raise HTTPException(401, "Invalid API key")
+
+    token = secrets.token_urlsafe(32)
+    conn = _get_db()
+    try:
+        conn.execute(
+            "INSERT INTO sessions (token, created_at) VALUES (?, ?)",
+            (token, datetime.now(UTC).isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    response.set_cookie(
+        SESSION_COOKIE,
+        token,
+        max_age=SESSION_MAX_AGE,
+        httponly=True,  # из JS не прочитать — при XSS куку не украсть
+        secure=COOKIE_SECURE,
+        samesite="lax",
+        path="/",
+    )
+    return {"status": "ok"}
+
+
+@app.post("/auth/logout")
+def logout(response: Response, session: str | None = Cookie(None)):
+    """Отозвать сессию. Без куки — не ошибка: выход и так состоялся."""
+    if session is not None:
+        conn = _get_db()
+        try:
+            conn.execute("DELETE FROM sessions WHERE token = ?", (session,))
+            conn.commit()
+        finally:
+            conn.close()
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return {"status": "ok"}
+
+
+@app.get("/auth/status", dependencies=[Depends(_check_key)])
+def auth_status():
+    """Живая ли сессия. Фронтенду нужно знать, показывать ли экран входа."""
+    return {"status": "ok"}
 
 
 @app.get("/health")

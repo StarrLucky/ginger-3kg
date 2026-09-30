@@ -16,12 +16,17 @@ def test_health_needs_no_auth(api):
     assert resp.json()["status"] == "ok"
 
 
-def test_missing_api_key_is_422_not_401(api):
-    """Header(...) делает заголовок обязательным, поэтому его отсутствие —
-    ошибка валидации FastAPI, а не 401. Фиксируем фактическое поведение:
-    клиенту надо уметь различать «не передал ключ» и «ключ неверный»."""
+def test_missing_credentials_is_401(api):
+    """Изменено в Фазе 2 (было 422).
+
+    422 был артефактом обязательного Header(...), а не решением: FastAPI
+    отвергал запрос как невалидный до того, как дело доходило до проверки
+    ключа. Теперь заголовок опционален (есть альтернатива — кука сессии),
+    и отсутствие учётных данных — это ровно 401. Shortcut и garmin-sync
+    заголовок всегда шлют, их это не касается.
+    """
     with TestClient(api.app) as anon:
-        assert anon.get("/day").status_code == 422
+        assert anon.get("/day").status_code == 401
 
 
 def test_wrong_api_key_is_401(api):

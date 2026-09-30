@@ -14,6 +14,7 @@ import httpx
 import nutrition as nut
 import recognize as rec
 from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 
@@ -44,6 +45,7 @@ API_KEY = os.getenv("FOOD_API_KEY", "")
 USER_TZ = ZoneInfo(os.getenv("USER_TIMEZONE", "UTC"))
 USDA_API_KEY = os.getenv("USDA_API_KEY", "")
 OVERRIDES_PATH = Path(__file__).parent / "overrides.json"
+WEBAPP_DIR = Path(__file__).parent / "webapp"
 # Лукап в справочник — два коротких запроса подряд; если USDA молчит полминуты,
 # ждать её дольше смысла нет, позиция всё равно уйдёт в needs_manual.
 LOOKUP_TIMEOUT = 30.0
@@ -979,3 +981,9 @@ def delete_log(log_id: int):
         return {"deleted_log_id": log_id, "day": _day_summary(conn, row["log_date"])}
     finally:
         conn.close()
+
+
+# Статика webapp. Путь абсолютный, а не "webapp": рабочий каталог различается
+# у uvicorn в контейнере, у локального запуска и у pytest из корня репозитория.
+# html=True отдаёт index.html на /app/ — без него был бы 404 на самом входе.
+app.mount("/app", StaticFiles(directory=WEBAPP_DIR, html=True), name="webapp")

@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<!-- viewport-fit=cover нужен, чтобы заработали env(safe-area-inset-*) на iPhone -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Еда</title>
+
+<!-- Запуск с экрана «Домой» без адресной строки. На iPhone это WebClip,
+     а не полноценная PWA: service worker урезан, Background Sync нет. -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Еда">
+<meta name="theme-color" content="#17130f">
+
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- Экран входа. Показан по умолчанию: если сессия жива, app.js его скроет,
+     и мигание длится один кадр вместо запроса к серверу. -->
+<section id="screen-login" class="screen">
+  <div class="login-box">
+    <img class="login-logo" src="icons/icon-192.png" alt="" width="72" height="72">
+    <h1>Еда</h1>
+    <form id="login-form" autocomplete="on">
+      <label class="field">
+        <span>Ключ доступа</span>
+        <input id="login-key" type="password" name="password" autocomplete="current-password"
+               inputmode="text" required>
+      </label>
+      <button class="primary" type="submit">Войти</button>
+      <p id="login-error" class="error" hidden></p>
+    </form>
+  </div>
+</section>
+
+<!-- Рабочая часть. hidden снимается после успешного входа. -->
+<div id="app" hidden>
+  <main>
+    <section id="screen-today" class="screen">
+      <header class="bar"><h1>Сегодня</h1></header>
+      <div id="today-body" class="placeholder">Загрузка…</div>
+    </section>
+
+    <section id="screen-add" class="screen" hidden>
+      <header class="bar"><h1>Добавить</h1></header>
+      <div id="add-body" class="placeholder"></div>
+    </section>
+
+    <section id="screen-edit" class="screen" hidden>
+      <header class="bar">
+        <button id="edit-back" class="ghost" type="button">Назад</button>
+        <h1>Правка</h1>
+      </header>
+      <div id="edit-body" class="placeholder"></div>
+    </section>
+
+    <section id="screen-settings" class="screen" hidden>
+      <header class="bar"><h1>Настройки</h1></header>
+      <div class="pad">
+        <button id="logout" class="danger" type="button">Выйти</button>
+        <p class="hint">Выход отзывает только эту сессию. На других устройствах вход сохранится.</p>
+      </div>
+    </section>
+  </main>
+
+  <nav id="tabs">
+    <button type="button" data-screen="today" class="active">Сегодня</button>
+    <button type="button" data-screen="add">Добавить</button>
+    <button type="button" data-screen="settings">Настройки</button>
+  </nav>
+</div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

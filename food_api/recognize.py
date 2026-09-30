@@ -23,7 +23,7 @@ from typing import Any, Literal, Protocol
 
 import httpx
 from nutrition import RecognizedItem
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 log = logging.getLogger(__name__)
 
@@ -42,9 +42,11 @@ MAX_IMAGE_B64_CHARS = 1_500_000
 
 MEAL_TYPES = ("breakfast", "lunch", "dinner", "snack")
 
-# Ответ короткий, но на Opus 5 адаптивное мышление тоже считается в max_tokens,
-# поэтому запас, а не 512.
-MAX_TOKENS = 4096
+# Ответ короткий, но на Opus 5 адаптивное мышление включено по умолчанию и тоже
+# считается в max_tokens. Обрезанный по лимиту JSON не разберётся, а structured
+# outputs от этого не спасают, поэтому берём рекомендованные для нестримингового
+# вызова ~16k, а не «сколько кажется достаточным».
+MAX_TOKENS = 16000
 
 
 class RecognizeError(RuntimeError):
@@ -81,7 +83,18 @@ class RecognizedMeal(BaseModel):
     items: list[RecognizedItemOut]
     meal_type: Literal["breakfast", "lunch", "dinner", "snack"]
     notes: str = ""
-    confidence: float = Field(ge=0.0, le=1.0)
+    confidence: float
+
+    @field_validator("confidence")
+    @classmethod
+    def _clamp_confidence(cls, value: float) -> float:
+        """Подрезать, а не отвергать.
+
+        Structured outputs не умеют minimum/maximum — модель вправе вернуть 95
+        вместо 0.95, и схема это пропустит. Ронять из-за косметического поля
+        весь разбор приёма пищи несоразмерно: позиции-то распознаны.
+        """
+        return min(1.0, max(0.0, value))
 
     def to_items(self) -> list[RecognizedItem]:
         """Перевод в то, что принимает nutrition.resolve()."""
@@ -114,7 +127,7 @@ RECOGNIZE_SCHEMA: dict[str, Any] = {
                     "unit": {"type": "string", "description": "g, ml, шт"},
                     "kind": {"type": "string", "enum": ["branded", "generic"]},
                     "lookup_query": {"type": "string", "description": "English, for USDA/OFF"},
-                    "brand": {"type": ["string", "null"]},
+                    "brand": {"anyOf": [{"type": "string"}, {"type": "null"}]},
                 },
                 "required": ["name", "quantity", "unit", "kind", "lookup_query", "brand"],
                 "additionalProperties": False,
@@ -138,18 +151,24 @@ def load_prompt(path: str | None = None) -> str:
 def to_gemini_schema(schema: dict[str, Any]) -> dict[str, Any]:
     """Схема в диалекте Gemini: он не знает additionalProperties и type-списков.
 
-    Вместо `"type": ["string", "null"]` у него `nullable`. Отдельная функция,
-    а не вторая копия схемы, — чтобы источник правды остался один.
+    Nullable у него выражается флагом `nullable`, а не через `anyOf`, и
+    `additionalProperties` он не знает вовсе. Отдельная функция, а не вторая
+    копия схемы, — чтобы источник правды остался один.
     """
+    if "anyOf" in schema:
+        variants = [v for v in schema["anyOf"] if v.get("type") != "null"]
+        if len(variants) != 1:
+            raise ValueError(f"anyOf из {len(variants)} вариантов Gemini не выразит")
+        converted = to_gemini_schema(variants[0])
+        if len(variants) != len(schema["anyOf"]):
+            converted["nullable"] = True
+        return converted
+
     out: dict[str, Any] = {}
     for key, value in schema.items():
         if key == "additionalProperties":
             continue
-        if key == "type" and isinstance(value, list):
-            out["type"] = next(t for t in value if t != "null")
-            if "null" in value:
-                out["nullable"] = True
-        elif key in {"properties", "items"} and isinstance(value, dict):
+        if key in {"properties", "items"} and isinstance(value, dict):
             out[key] = (
                 {k: to_gemini_schema(v) for k, v in value.items()}
                 if key == "properties"
@@ -208,17 +227,21 @@ class Recognizer(Protocol):
         now: str | None = None,
     ) -> RecognizedMeal: ...
 
+    async def aclose(self) -> None: ...
+
 
 class BaseRecognizer(ABC):
     """Общая обвязка: проверки на входе, валидация и политика повтора на выходе.
 
-    Повтор включён только там, где схему не гарантирует провайдер (локальная
-    модель). Anthropic и Gemini держат форму сами — там ретрай лишь удвоил бы
-    счёт за ту же ошибку.
+    Повтор включён у всех провайдеров, а не только у локального. Structured
+    outputs гарантируют набор полей, но не диапазоны: `minimum`/`maximum`/
+    `minLength` в них не поддержаны, поэтому «quantity: 0» или «confidence: 95»
+    пройдут схему и упадут на Pydantic. Один повтор с текстом ошибки дешевле,
+    чем отказ всего запроса из-за такого ответа.
     """
 
     name = "base"
-    retry_on_invalid = False
+    retry_on_invalid = True
 
     def __init__(self, prompt: str | None = None) -> None:
         self.prompt = prompt if prompt is not None else load_prompt()
@@ -235,7 +258,7 @@ class BaseRecognizer(ABC):
             raise RecognizeError("нужен text или image_b64")
         if image_b64 and len(image_b64) > MAX_IMAGE_B64_CHARS:
             raise RecognizeError(
-                f"картинка {len(image_b64)} байт base64, лимит {MAX_IMAGE_B64_CHARS}"
+                f"картинка — {len(image_b64)} символов base64, лимит {MAX_IMAGE_B64_CHARS}"
             )
 
         user_text = _user_text(text, now)
@@ -256,6 +279,9 @@ class BaseRecognizer(ABC):
             )
             return validate(payload)
 
+    async def aclose(self) -> None:  # noqa: B027 - не абстрактный намеренно
+        """Отпустить ресурсы. У провайдера без своего клиента их нет."""
+
     @abstractmethod
     async def _call(
         self,
@@ -265,6 +291,56 @@ class BaseRecognizer(ABC):
         media_type: str,
         repair: str | None = None,
     ) -> dict[str, Any]: ...
+
+
+class HttpRecognizer(BaseRecognizer):
+    """Провайдер, который ходит по HTTP сам (Gemini, локальная модель).
+
+    Клиент создаётся один раз и переиспользуется: вызов модели и так стоит
+    5-20 с, и открывать под каждый новый TLS-хэндшейк — платить за латентность
+    дважды. Переданный извне клиент считается чужим и не закрывается.
+    """
+
+    def __init__(self, prompt: str | None = None, client: httpx.AsyncClient | None = None) -> None:
+        super().__init__(prompt)
+        self._client = client
+        self._owned: httpx.AsyncClient | None = None
+
+    def http(self) -> httpx.AsyncClient:
+        if self._client is not None:
+            return self._client
+        if self._owned is None:
+            self._owned = httpx.AsyncClient(timeout=60.0)
+        return self._owned
+
+    async def aclose(self) -> None:
+        if self._owned is not None:
+            await self._owned.aclose()
+            self._owned = None
+
+    async def _post_json(
+        self,
+        url: str,
+        *,
+        json: dict[str, Any],
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """POST с общей обработкой ошибок.
+
+        Тело, пришедшее с кодом 200, но не разобравшееся как JSON (HTML-страница
+        от прокси, пустой ответ), — это ошибка формы, а не транспорта: она
+        получает повтор. Отказ сети или 5xx повтора не получает.
+        """
+        try:
+            response = await self.http().post(url, json=json, params=params, headers=headers)
+            response.raise_for_status()
+        except (httpx.HTTPError, httpx.InvalidURL) as err:
+            raise RecognizeError(f"запрос к {url} не удался: {err}") from err
+        try:
+            return response.json()
+        except ValueError as err:
+            raise RecognizeFormatError(f"ответ {url} — не JSON: {err}") from err
 
 
 class AnthropicRecognizer(BaseRecognizer):
@@ -284,6 +360,7 @@ class AnthropicRecognizer(BaseRecognizer):
         self.model = model
         self.api_key = api_key
         self._client = client
+        self._owns_client = client is None
 
     def client(self) -> Any:
         """Ленивое создание клиента: без вызова SDK не нужен даже установленным."""
@@ -294,6 +371,11 @@ class AnthropicRecognizer(BaseRecognizer):
                 raise RecognizeError("пакет anthropic не установлен") from err
             self._client = anthropic.AsyncAnthropic(api_key=self.api_key or None)
         return self._client
+
+    async def aclose(self) -> None:
+        if self._owns_client and self._client is not None:
+            await self._client.close()
+            self._client = None
 
     async def _call(
         self,
@@ -325,15 +407,20 @@ class AnthropicRecognizer(BaseRecognizer):
                 "effort": "low",
             },
         )
-        if getattr(response, "stop_reason", None) == "refusal":
+        stop = getattr(response, "stop_reason", None)
+        if stop == "refusal":
             raise RecognizeError("модель отказалась отвечать")
+        if stop == "max_tokens":
+            # JSON оборван на полуслове. Без этой ветки диагноз был бы
+            # «ответ не разобрался как JSON» — правдивый, но уводящий не туда.
+            raise RecognizeError(f"ответ не уместился в {MAX_TOKENS} токенов")
         text = next((b.text for b in response.content if b.type == "text"), None)
         if text is None:
             raise RecognizeError("в ответе нет текстового блока")
         return _loads(text)
 
 
-class GeminiRecognizer(BaseRecognizer):
+class GeminiRecognizer(HttpRecognizer):
     """Бесплатный тариф Google AI Studio.
 
     Не дефолт осознанно: на free tier Google учится на данных, а здесь это фото
@@ -351,10 +438,9 @@ class GeminiRecognizer(BaseRecognizer):
         client: httpx.AsyncClient | None = None,
         prompt: str | None = None,
     ) -> None:
-        super().__init__(prompt)
+        super().__init__(prompt, client)
         self.api_key = api_key
         self.model = model
-        self._client = client
 
     async def _call(
         self,
@@ -377,11 +463,13 @@ class GeminiRecognizer(BaseRecognizer):
                 "responseSchema": to_gemini_schema(RECOGNIZE_SCHEMA),
             },
         }
-        data = await _post_json(
-            self._client,
+        # Ключ заголовком, а не в query: httpx вшивает URL с параметрами в текст
+        # httpx.HTTPStatusError, а этот текст уходит в лог и в сообщение об ошибке.
+        # Ключ в строке запроса утекал бы при каждом 400 от Gemini.
+        data = await self._post_json(
             GEMINI_URL.format(model=self.model),
             json=body,
-            params={"key": self.api_key},
+            headers={"x-goog-api-key": self.api_key},
         )
         try:
             text = data["candidates"][0]["content"]["parts"][0]["text"]
@@ -390,15 +478,14 @@ class GeminiRecognizer(BaseRecognizer):
         return _loads(text)
 
 
-class LocalRecognizer(BaseRecognizer):
+class LocalRecognizer(HttpRecognizer):
     """Ollama на M4 через OpenAI-совместимый эндпоинт.
 
-    Локальные модели держат схему хуже, поэтому единственный провайдер с
-    включённым повтором: ошибка валидации уходит в промпт и даётся второй шанс.
+    Локальные модели держат схему хуже всех, но политика повтора теперь общая
+    (см. BaseRecognizer): ошибка формы уходит в промпт и даётся второй шанс.
     """
 
     name = "local"
-    retry_on_invalid = True
 
     def __init__(
         self,
@@ -408,10 +495,9 @@ class LocalRecognizer(BaseRecognizer):
         client: httpx.AsyncClient | None = None,
         prompt: str | None = None,
     ) -> None:
-        super().__init__(prompt)
+        super().__init__(prompt, client)
         self.url = url
         self.model = model
-        self._client = client
 
     async def _call(
         self,
@@ -456,7 +542,7 @@ class LocalRecognizer(BaseRecognizer):
                 },
             },
         }
-        data = await _post_json(self._client, self.url, json=body)
+        data = await self._post_json(self.url, json=body)
         try:
             text = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as err:
@@ -493,29 +579,16 @@ class FallbackRecognizer:
                 errors.append(f"{recognizer.name}: {err}")
         raise RecognizeError("все провайдеры отказали — " + "; ".join(errors))
 
-
-async def _post_json(
-    client: httpx.AsyncClient | None,
-    url: str,
-    *,
-    json: dict[str, Any],
-    params: dict[str, str] | None = None,
-) -> dict[str, Any]:
-    """POST с общей обработкой ошибок. Свой клиент, если не передали чужой."""
-    owned = client is None
-    client = client or httpx.AsyncClient(timeout=60.0)
-    try:
-        response = await client.post(url, json=json, params=params)
-        response.raise_for_status()
-        return response.json()
-    except httpx.HTTPError as err:
-        raise RecognizeError(f"запрос к {url} не удался: {err}") from err
-    finally:
-        if owned:
-            await client.aclose()
+    async def aclose(self) -> None:
+        for recognizer in self.recognizers:
+            await recognizer.aclose()
 
 
 def _build_anthropic(env: dict[str, str]) -> Recognizer:
+    if not env.get("ANTHROPIC_API_KEY"):
+        # Не ошибка: SDK умеет брать учётку и из профиля `ant auth login`.
+        # Но на Pi профиля нет, и молчать об этом до первого фото не стоит.
+        log.warning("ANTHROPIC_API_KEY не задан — SDK будет искать учётку сам")
     return AnthropicRecognizer(
         model=env.get("RECOGNIZE_MODEL") or DEFAULT_ANTHROPIC_MODEL,
         api_key=env.get("ANTHROPIC_API_KEY"),

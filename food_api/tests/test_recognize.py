@@ -68,6 +68,15 @@ def test_schema_matches_model():
 # --- валидация и перевод в шаг 2 -------------------------------------------
 
 
+@pytest.mark.parametrize(("given", "expected"), [(95, 1.0), (-1, 0.0), (0.42, 0.42)])
+def test_confidence_is_clamped(given, expected):
+    """Схема не умеет minimum/maximum, поэтому 95 вместо 0.95 придёт и пройдёт.
+
+    Ронять из-за косметического поля весь разбор несоразмерно — подрезаем.
+    """
+    assert rec.validate({**MEAL, "confidence": given}).confidence == expected
+
+
 def test_to_items_feeds_nutrition():
     items = rec.validate(MEAL).to_items()
     assert isinstance(items[0], nut.RecognizedItem)
@@ -78,11 +87,10 @@ def test_to_items_feeds_nutrition():
     "broken",
     [
         {**MEAL, "meal_type": "brunch"},
-        {**MEAL, "confidence": 1.5},
         {**MEAL, "items": [{**MEAL["items"][0], "quantity": 0}]},
         {**MEAL, "items": [{**MEAL["items"][0], "kind": "homemade"}]},
     ],
-    ids=["meal_type", "confidence", "quantity", "kind"],
+    ids=["meal_type", "quantity", "kind"],
 )
 def test_validation_rejects(broken):
     with pytest.raises(rec.RecognizeError):
@@ -155,12 +163,26 @@ async def test_anthropic_refusal_is_an_error():
         await rec.AnthropicRecognizer(client=fake, prompt=PROMPT).recognize(text="еда")
 
 
-async def test_anthropic_does_not_retry():
-    """Схему гарантирует провайдер — повтор только удвоил бы счёт."""
+async def test_anthropic_retries_once():
+    """Structured outputs гарантируют набор полей, но не диапазоны значений.
+
+    minimum/maximum/minLength в них не поддержаны, поэтому ответ может пройти
+    схему и упасть на Pydantic — второй шанс нужен и здесь, не только локальной
+    модели.
+    """
     fake = FakeAnthropic(anthropic_response("не json"), anthropic_response(MEAL))
-    with pytest.raises(rec.RecognizeError):
+    meal = await rec.AnthropicRecognizer(client=fake, prompt=PROMPT).recognize(text="еда")
+    assert meal.items[0].name == "гречка"
+    assert len(fake.messages.calls) == 2
+
+
+async def test_anthropic_reports_truncation():
+    """Обрезка по max_tokens получает свой диагноз, а не «не разобрался JSON»."""
+    fake = FakeAnthropic(
+        SimpleNamespace(stop_reason="max_tokens", content=[SimpleNamespace(type="text", text="{")])
+    )
+    with pytest.raises(rec.RecognizeError, match="не уместился"):
         await rec.AnthropicRecognizer(client=fake, prompt=PROMPT).recognize(text="еда")
-    assert len(fake.messages.calls) == 1
 
 
 # --- локальная модель -------------------------------------------------------
@@ -214,10 +236,17 @@ async def test_http_error_becomes_recognize_error():
 # --- Gemini -----------------------------------------------------------------
 
 
+def test_schema_uses_documented_union_form():
+    """anyOf — то, что structured outputs поддерживают; список типов там не значится."""
+    brand = rec.RECOGNIZE_SCHEMA["properties"]["items"]["items"]["properties"]["brand"]
+    assert brand == {"anyOf": [{"type": "string"}, {"type": "null"}]}
+
+
 def test_gemini_schema_dialect():
     """У Gemini нет additionalProperties, а null выражается через nullable."""
     schema = rec.to_gemini_schema(rec.RECOGNIZE_SCHEMA)
     assert "additionalProperties" not in json.dumps(schema)
+    assert "anyOf" not in json.dumps(schema)
     brand = schema["properties"]["items"]["items"]["properties"]["brand"]
     assert brand == {"type": "string", "nullable": True}
     assert schema["properties"]["meal_type"]["enum"] == list(rec.MEAL_TYPES)
@@ -227,7 +256,7 @@ async def test_gemini_parses_response():
     calls = []
 
     def handler(request):
-        calls.append(json.loads(request.content))
+        calls.append({"body": json.loads(request.content), "url": str(request.url)})
         return httpx.Response(
             200,
             json={"candidates": [{"content": {"parts": [{"text": json.dumps(MEAL)}]}}]},
@@ -238,7 +267,27 @@ async def test_gemini_parses_response():
         text="гречка"
     )
     assert meal.items[0].lookup_query == "buckwheat groats, cooked"
-    assert calls[0]["generationConfig"]["responseMimeType"] == "application/json"
+    assert calls[0]["body"]["generationConfig"]["responseMimeType"] == "application/json"
+
+
+async def test_gemini_key_goes_in_header_not_url():
+    """Ключ в query утекал бы в текст httpx-ошибки, а оттуда в лог."""
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        seen["key"] = request.headers.get("x-goog-api-key")
+        return httpx.Response(
+            200, json={"candidates": [{"content": {"parts": [{"text": json.dumps(MEAL)}]}}]}
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    # Не похожий на настоящий: строка вида AIza... ловится сканером секретов,
+    # и правильно делает.
+    key = "not-a-real-key"
+    await rec.GeminiRecognizer(api_key=key, client=client, prompt=PROMPT).recognize(text="еда")
+    assert seen["key"] == key
+    assert key not in seen["url"]
 
 
 # --- фолбэк и сборка по окружению -------------------------------------------
@@ -315,3 +364,48 @@ async def test_transport_error_is_not_retried():
     with pytest.raises(rec.RecognizeError, match="не удался"):
         await rec.LocalRecognizer(client=client, prompt=PROMPT).recognize(text="еда")
     assert len(calls) == 1
+
+
+async def test_non_json_body_is_a_format_error():
+    """200 с HTML от прокси — ошибка формы: она получает повтор, а не 500."""
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        if len(calls) == 1:
+            return httpx.Response(200, text="<html>bad gateway</html>")
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(MEAL)}}]})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    meal = await rec.LocalRecognizer(client=client, prompt=PROMPT).recognize(text="еда")
+    assert meal.items[0].name == "гречка"
+    assert len(calls) == 2
+
+
+async def test_owned_http_client_is_reused_and_closed():
+    """Один клиент на распознаватель: вызов и так стоит 5-20 с, TLS на каждый — лишнее."""
+    recognizer = rec.LocalRecognizer(prompt=PROMPT)
+    assert recognizer.http() is recognizer.http()
+    await recognizer.aclose()
+    assert recognizer._owned is None
+
+
+async def test_injected_http_client_is_not_closed():
+    """Чужой клиент закрывать не наше дело."""
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+    recognizer = rec.LocalRecognizer(client=client, prompt=PROMPT)
+    await recognizer.aclose()
+    assert not client.is_closed
+    await client.aclose()
+
+
+async def test_fallback_closes_every_provider():
+    class Closable(Stub):
+        closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    first, second = Closable("a", OSError("нет")), Closable("b", rec.validate(MEAL))
+    await rec.FallbackRecognizer([first, second]).aclose()
+    assert (first.closed, second.closed) == (True, True)

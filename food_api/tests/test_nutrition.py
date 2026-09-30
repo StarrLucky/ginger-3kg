@@ -180,6 +180,26 @@ async def test_usda_lookup_maps_nutrients_and_scales(conn):
     assert res.nutrients["sodium_mg"] == pytest.approx(1.8)
 
 
+async def test_usda_key_goes_in_header_not_url(conn):
+    """Ключ в query утёк бы в текст HTTPStatusError, а оттуда в лог и source_ref."""
+    seen = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append((str(request.url), request.headers.get("x-api-key")))
+        if "foods/search" in request.url.path:
+            return httpx.Response(200, json={"foods": [usda_food(1, "SR Legacy")]})
+        return httpx.Response(200, json=usda_detail("x", FULL_PANEL))
+
+    async with mock_client(handle) as client:
+        await nut.resolve([item()], conn, overrides={}, usda_api_key="zzz-no-key", client=client)
+
+    assert seen, "до USDA дело не дошло"
+    for url, header in seen:
+        assert "zzz-no-key" not in url, f"ключ в URL: {url}"
+        assert "api_key" not in url, f"параметр api_key остался в URL: {url}"
+        assert header == "zzz-no-key", "ключ не доехал заголовком"
+
+
 async def test_usda_skips_candidate_without_calories(conn):
     """Найдено на живом API: у Foundation-записей энергии часто нет.
 

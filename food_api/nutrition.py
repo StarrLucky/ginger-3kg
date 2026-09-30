@@ -204,15 +204,17 @@ async def usda_lookup(
     даже калорий), поэтому по каждому кандидату дозапрашиваем детальную
     карточку и берём первого, у кого калории реально есть. SR Legacy идёт
     первым: его панели заполнены полнее, чем у Foundation.
+
+    Ключ идёт заголовком, а не query-параметром: httpx вшивает полный URL в
+    текст `HTTPStatusError`, а этот текст попадает в лог и в source_ref
+    («справочник недоступен»). Ключ в параметрах утёк бы туда при первом же
+    сбое USDA. api.data.gov принимает X-Api-Key наравне с ?api_key=.
     """
+    headers = {"X-Api-Key": api_key}
     resp = await client.get(
         USDA_SEARCH_URL,
-        params={
-            "api_key": api_key,
-            "query": query,
-            "dataType": "Foundation,SR Legacy",
-            "pageSize": 5,
-        },
+        params={"query": query, "dataType": "Foundation,SR Legacy", "pageSize": 5},
+        headers=headers,
     )
     resp.raise_for_status()
     foods = resp.json().get("foods", [])
@@ -222,9 +224,7 @@ async def usda_lookup(
         fdc_id = food.get("fdcId")
         if not fdc_id:
             continue
-        detail_resp = await client.get(
-            USDA_DETAIL_URL.format(fdc_id=fdc_id), params={"api_key": api_key}
-        )
+        detail_resp = await client.get(USDA_DETAIL_URL.format(fdc_id=fdc_id), headers=headers)
         if detail_resp.status_code != 200:
             continue
         detail = detail_resp.json()

@@ -117,3 +117,45 @@ def test_dockerfile_ships_the_webapp():
     """Без этой строки образ поднимется, а /app/ отдаст 404."""
     dockerfile = (WEBAPP.parent / "Dockerfile").read_text(encoding="utf-8")
     assert "COPY webapp/" in dockerfile
+
+
+def test_module_imports_resolve():
+    """Без сборщика опечатку в пути импорта не поймает никто.
+
+    Браузер просто не исполнит модуль, и приложение останется пустым экраном.
+    """
+    for source in WEBAPP.glob("*.js"):
+        text = source.read_text(encoding="utf-8")
+        specs = re.findall(r"""import\s+(?:.*?\s+from\s+)?['"](\./[^'"]+)['"]""", text, re.DOTALL)
+        for spec in specs:
+            target = (source.parent / spec).resolve()
+            assert target.exists(), f"{source.name} импортирует несуществующий {spec}"
+
+
+def test_every_element_id_used_by_app_exists_in_html():
+    """$('btn-save') по несуществующему id вернёт null.
+
+    Дальше addEventListener роняет весь модуль на загрузке — молча, до того
+    как что-либо отрисуется.
+    """
+    html = (WEBAPP / "index.html").read_text(encoding="utf-8")
+    present = set(re.findall(r'id="([^"]+)"', html))
+
+    for source in (WEBAPP / "app.js",):
+        used = set(re.findall(r"\$\('([^']+)'\)", source.read_text(encoding="utf-8")))
+        missing = used - present
+        assert not missing, f"{source.name} обращается к отсутствующим id: {sorted(missing)}"
+
+
+def test_draft_item_fields_match_the_api_contract():
+    """Экран правки редактирует ровно те поля, которые принимает POST /logs."""
+    import api as api_module
+
+    macros = re.search(
+        r"const MACROS = \[(.*?)\];", (WEBAPP / "render.js").read_text("utf-8"), re.DOTALL
+    )
+    assert macros, "список MACROS в render.js не найден"
+
+    keys = re.findall(r"\['([a-z_]+)'", macros.group(1))
+    unknown = [k for k in keys if k not in api_module.NUTRIENTS]
+    assert not unknown, f"render.js правит поля, которых нет в схеме: {unknown}"

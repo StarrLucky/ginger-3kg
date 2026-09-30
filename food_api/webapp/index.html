@@ -48,7 +48,28 @@
 
     <section id="screen-add" class="screen" hidden>
       <header class="bar"><h1>Добавить</h1></header>
-      <div id="add-body" class="placeholder"></div>
+      <div class="pad">
+        <!-- capture="environment" открывает камеру сразу, минуя выбор источника -->
+        <input id="pick-camera" class="hidden-input" type="file" accept="image/*"
+               capture="environment">
+        <input id="pick-library" class="hidden-input" type="file" accept="image/*">
+
+        <div class="add-actions">
+          <button id="btn-camera" class="primary" type="button">Снять</button>
+          <button id="btn-library" type="button">Из галереи</button>
+        </div>
+
+        <p id="photo-note" class="hint" hidden></p>
+
+        <label class="field">
+          <span>Или опиши словами</span>
+          <textarea id="add-text" rows="3" placeholder="180 г гречки и куриная грудка"></textarea>
+        </label>
+
+        <button id="btn-recognize" class="primary" type="button">Распознать</button>
+        <p id="add-status" class="hint" hidden></p>
+        <p id="add-error" class="error" hidden></p>
+      </div>
     </section>
 
     <section id="screen-edit" class="screen" hidden>
@@ -56,7 +77,11 @@
         <button id="edit-back" class="ghost" type="button">Назад</button>
         <h1>Правка</h1>
       </header>
-      <div id="edit-body" class="placeholder"></div>
+      <div id="edit-body"></div>
+      <div class="pad">
+        <p id="edit-warning" class="error" hidden></p>
+        <button id="btn-save" class="primary" type="button">Сохранить</button>
+      </div>
     </section>
 
     <section id="screen-settings" class="screen" hidden>

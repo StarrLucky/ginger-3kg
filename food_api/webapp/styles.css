@@ -136,3 +136,99 @@ main {
 @media (prefers-reduced-motion: no-preference) {
   button { transition: opacity .12s ease; }
 }
+
+/* --- экран дня --------------------------------------------------------- */
+
+.totals {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  padding: var(--pad);
+}
+
+.total { background: var(--surface); border-radius: var(--radius); padding: 12px 6px; text-align: center; }
+.total b { display: block; font-size: 18px; }
+.total span { font-size: 12px; color: var(--muted); }
+
+.progress { padding: var(--pad); display: grid; gap: 14px; }
+.progress-head { display: flex; justify-content: space-between; font-size: 14px; margin-bottom: 6px; }
+.progress-label { color: var(--muted); }
+.progress-nums { font-variant-numeric: tabular-nums; }
+
+.track { height: 8px; background: var(--surface-2); border-radius: 999px; overflow: hidden; }
+.fill { height: 100%; background: var(--accent); border-radius: 999px; }
+/* Перебор виден цветом: полоса упёрлась в край, но факт не спрятан */
+.fill.over { background: var(--danger); }
+
+.meal { padding: 0 var(--pad) var(--pad); }
+.meal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin: 18px 0 8px;
+}
+.meal-head h2 { margin: 0; font-size: 15px; color: var(--muted); font-weight: 600; }
+.meal-kcal { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+.item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  background: var(--surface);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  margin-bottom: 6px;
+  min-height: var(--tap);
+}
+.item-main { display: flex; flex-direction: column; min-width: 0; }
+.item-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item-qty { font-size: 13px; color: var(--muted); }
+.item-kcal { font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+/* --- добавление -------------------------------------------------------- */
+
+.hidden-input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.add-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: var(--pad); }
+.add-actions button { width: 100%; }
+
+textarea {
+  width: 100%;
+  padding: 12px;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  font: inherit;
+  font-size: 16px;  /* меньше — и iOS зумит страницу при фокусе */
+  resize: vertical;
+}
+
+/* --- правка ------------------------------------------------------------ */
+
+.draft-meta { padding-bottom: 0; }
+
+.draft-item {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin: 0 var(--pad) 10px;
+}
+
+/* Позиция без чисел из справочника: пока не заполнена, сохранение заблокировано */
+.draft-item.needs-manual { border-color: var(--danger); }
+
+.draft-head { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+.draft-head input { flex: 1; }
+.remove { flex: 0 0 auto; }
+
+.qty-row { display: grid; grid-template-columns: 2fr 1fr; gap: 8px; margin-bottom: 8px; }
+
+.macro-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+.macro { display: flex; flex-direction: column; gap: 4px; }
+.macro span { font-size: 11px; color: var(--muted); }
+.macro input { padding: 0 8px; }
+
+.source { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
+.needs-manual .source { color: var(--danger); }

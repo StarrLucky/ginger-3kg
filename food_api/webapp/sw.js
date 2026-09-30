@@ -11,6 +11,8 @@ const SHELL = [
   './styles.css',
   './app.js',
   './api.js',
+  './photo.js',
+  './render.js',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/apple-touch-icon.png',

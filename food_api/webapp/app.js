@@ -50,8 +50,20 @@ function say(node, text, kind = 'hint') {
 
 function paintDay(day) {
   const body = $('today-body');
-  body.replaceChildren(renderDay(day));
+  body.replaceChildren(renderDay(day, { onDelete: removeLog }));
   body.className = '';
+}
+
+async function removeLog(logId) {
+  try {
+    // Ответ уже содержит пересчитанный день — второй запрос не нужен.
+    paintDay((await api.deleteLog(logId)).day);
+  } catch (err) {
+    // 404 значит, что запись уже убрали с другого устройства: перерисовать
+    // день правильнее, чем показывать ошибку про то, чего и так нет.
+    if (err.status === 404) loadDay();
+    else say($('today-body'), `Не удалось удалить: ${err.message}`, 'placeholder');
+  }
 }
 
 async function loadDay() {

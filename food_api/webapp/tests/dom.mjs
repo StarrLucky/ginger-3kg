@@ -30,6 +30,7 @@ class Node {
   }
   get className() { return [...this.classList.set].join(' '); }
   append(...nodes) { this.children.push(...nodes); }
+  replaceChildren(...nodes) { this.children = [...nodes]; }
   setAttribute(name, value) { this.attributes[name] = value; }
   addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
   fire(type) { for (const fn of this.listeners[type] || []) fn({ target: this }); }

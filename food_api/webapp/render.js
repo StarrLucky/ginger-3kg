@@ -33,7 +33,7 @@ const num = (value, digits = 1) =>
 
 /* --- экран дня -------------------------------------------------------- */
 
-export function renderDay(day) {
+export function renderDay(day, { onDelete = () => {} } = {}) {
   const root = el('div', 'day');
 
   // Итоги — всегда. Раньше они подменялись полосами прогресса, и при цели,
@@ -50,7 +50,7 @@ export function renderDay(day) {
     return root;
   }
 
-  for (const meal of day.meals) root.append(renderMeal(meal));
+  for (const meal of day.meals) root.append(renderMeal(meal, onDelete));
   return root;
 }
 
@@ -99,7 +99,7 @@ function renderProgress(day) {
   return box;
 }
 
-function renderMeal(meal) {
+function renderMeal(meal, onDelete) {
   const box = el('section', 'meal');
   const head = el('div', 'meal-head');
   head.append(
@@ -108,7 +108,32 @@ function renderMeal(meal) {
   );
   box.append(head);
 
-  for (const item of meal.items) {
+  for (const group of groupByLog(meal.items)) {
+    box.append(renderLogGroup(group, onDelete));
+  }
+  return box;
+}
+
+/** Позиции одной записи — вместе.
+
+    DELETE /logs/{id} убирает запись целиком, а один приём пищи может
+    состоять из нескольких записей (обед записали дважды). Без группировки
+    кнопка удаления стояла бы у позиции, а уносила бы соседние — то есть
+    показанное не совпадало бы с удаляемым. */
+function groupByLog(items) {
+  const byLog = new Map();
+  for (const item of items) {
+    if (!byLog.has(item.log_id)) byLog.set(item.log_id, []);
+    byLog.get(item.log_id).push(item);
+  }
+  return [...byLog.entries()].map(([logId, group]) => ({ logId, items: group }));
+}
+
+function renderLogGroup(group, onDelete) {
+  const box = el('div', 'log-group');
+  box.dataset.logId = group.logId;
+
+  for (const item of group.items) {
     const row = el('div', 'item');
     const main = el('div', 'item-main');
     main.append(
@@ -116,9 +141,38 @@ function renderMeal(meal) {
       el('span', 'item-qty', `${num(item.quantity)} ${item.unit}`),
     );
     row.append(main, el('span', 'item-kcal', `${num(item.calories_kcal, 0)} ккал`));
-    row.dataset.logId = item.log_id;
     box.append(row);
   }
+
+  const actions = el('div', 'log-actions');
+
+  // Удаление необратимо, поэтому в два шага. Не confirm(): в приложении с
+  // экрана «Домой» системный диалог показывает домен и выглядит чужеродно.
+  const idle = () => {
+    const button = el('button', 'ghost', 'Убрать');
+    button.type = 'button';
+    button.addEventListener('click', () => actions.replaceChildren(...armed()));
+    return [button];
+  };
+
+  const armed = () => {
+    const what =
+      group.items.length > 1 ? `Удалить все ${group.items.length} позиции?` : 'Удалить?';
+    const label = el('span', 'confirm-label', what);
+
+    const yes = el('button', 'danger', 'Да');
+    yes.type = 'button';
+    yes.addEventListener('click', () => onDelete(group.logId));
+
+    const no = el('button', 'ghost', 'Отмена');
+    no.type = 'button';
+    no.addEventListener('click', () => actions.replaceChildren(...idle()));
+
+    return [label, no, yes];
+  };
+
+  actions.replaceChildren(...idle());
+  box.append(actions);
   return box;
 }
 

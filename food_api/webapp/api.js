@@ -79,6 +79,7 @@ export const authStatus = () => request('auth/status');
 
 export const day = (date) => request(date ? `day?date=${encodeURIComponent(date)}` : 'day');
 export const saveLog = (draft) => request('logs', { method: 'POST', body: draft });
+export const deleteLog = (logId) => request(`logs/${logId}`, { method: 'DELETE' });
 
 // Pi + туннель + модель дают 5-20 с; двадцатисекундного таймаута тут мало.
 export const recognize = (payload) =>

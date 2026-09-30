@@ -84,6 +84,22 @@ def test_empty_items_rejected(client):
     assert client.post("/logs", json={"items": []}).status_code == 422
 
 
+def test_delete_returns_the_recomputed_day(client, log_food):
+    """Webapp перерисовывает экран из этого ответа, без второго запроса."""
+    log_food(calories_kcal=500, meal_type="lunch")
+    keep = log_food(calories_kcal=300, meal_type="dinner")["log_id"]
+
+    body = client.delete(f"/logs/{keep}").json()
+    assert body["deleted_log_id"] == keep
+    assert body["day"]["totals"]["calories_kcal"] == 500, "день должен быть уже пересчитан"
+    assert [m["meal_type"] for m in body["day"]["meals"]] == ["lunch"]
+
+
+def test_deleting_a_missing_log_is_404(client):
+    """Фронт трактует 404 как «уже убрали с другого устройства» и перерисовывает."""
+    assert client.delete("/logs/999").status_code == 404
+
+
 def test_log_can_be_deleted(client, log_food):
     log_id = log_food(calories_kcal=500)["log_id"]
     assert client.delete(f"/logs/{log_id}").status_code == 200

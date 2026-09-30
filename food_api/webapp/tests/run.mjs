@@ -62,6 +62,76 @@ test('перебор цели виден цветом, а полоса не вы
   assert.ok(fill.classList.contains('over'), 'перебор обязан быть отмечен');
 });
 
+/* --- удаление записи -------------------------------------------------- */
+
+/** День, где один обед состоит из двух отдельных записей. */
+const twoLogs = () => ({
+  date: '2026-09-30',
+  totals: { calories_kcal: 800, protein_g: 30, fat_total_g: 10, carbs_g: 140 },
+  meals: [
+    {
+      meal_type: 'lunch',
+      calories_kcal: 800,
+      items: [
+        { log_id: 1, name: 'гречка', quantity: 180, unit: 'g', calories_kcal: 617 },
+        { log_id: 1, name: 'масло', quantity: 10, unit: 'g', calories_kcal: 75 },
+        { log_id: 2, name: 'яблоко', quantity: 150, unit: 'g', calories_kcal: 108 },
+      ],
+    },
+  ],
+  activity: { burned_kcal: 0, items: [] },
+});
+
+test('позиции одной записи сгруппированы вместе', () => {
+  // DELETE убирает запись целиком; без группировки кнопка стояла бы у
+  // позиции, а уносила бы соседние — показанное не совпало бы с удаляемым.
+  const root = renderDay(twoLogs());
+  const groups = root.findAll('log-group');
+  assert.equal(groups.length, 2, 'две записи — две группы');
+  assert.equal(groups[0].findAll('item').length, 2, 'гречка и масло вместе');
+  assert.equal(groups[1].findAll('item').length, 1);
+});
+
+test('удаление подтверждается в два шага', () => {
+  let deleted = null;
+  const root = renderDay(twoLogs(), { onDelete: (id) => { deleted = id; } });
+  const actions = root.findAll('log-group')[1].find('log-actions');
+
+  actions.children[0].fire('click'); // «Убрать»
+  assert.equal(deleted, null, 'первое нажатие удалять не должно');
+
+  const yes = actions.children.find((c) => c.textContent === 'Да');
+  yes.fire('click');
+  assert.equal(deleted, 2, 'удалиться должна именно вторая запись');
+});
+
+test('отмена возвращает кнопку в исходное состояние', () => {
+  let deleted = null;
+  const root = renderDay(twoLogs(), { onDelete: (id) => { deleted = id; } });
+  const actions = root.find('log-actions');
+
+  actions.children[0].fire('click');
+  actions.children.find((c) => c.textContent === 'Отмена').fire('click');
+
+  assert.equal(deleted, null);
+  assert.equal(actions.children.length, 1, 'должна остаться одна кнопка');
+  assert.equal(actions.children[0].textContent, 'Убрать');
+});
+
+test('подтверждение предупреждает, что уйдут все позиции записи', () => {
+  const root = renderDay(twoLogs());
+  const actions = root.findAll('log-group')[0].find('log-actions');
+  actions.children[0].fire('click');
+  assert.match(actions.find('confirm-label').textContent, /все 2 позиции/);
+});
+
+test('у записи из одной позиции текст короткий', () => {
+  const root = renderDay(twoLogs());
+  const actions = root.findAll('log-group')[1].find('log-actions');
+  actions.children[0].fire('click');
+  assert.equal(actions.find('confirm-label').textContent, 'Удалить?');
+});
+
 /* --- экран правки ---------------------------------------------------- */
 
 const draft = (overrides = {}) => ({

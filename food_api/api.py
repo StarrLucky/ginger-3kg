@@ -69,6 +69,11 @@ SESSION_MAX_AGE = 365 * 24 * 60 * 60
 # FOOD_API_KEY — без счётчика её подбирают без ограничений по скорости.
 LOGIN_MAX_FAILURES = 5
 LOGIN_LOCKOUT_SECONDS = 300
+# За туннелем request.client.host — адрес прокси, а не клиента, и счётчик
+# сложил бы всех в одно ведро. Заголовок с настоящим адресом берём только если
+# он назван явно (Cloudflare — CF-Connecting-IP, Caddy — X-Forwarded-For):
+# доверять ему без настройки нельзя, клиент подставит любой и обойдёт счётчик.
+TRUST_CLIENT_IP_HEADER = os.getenv("TRUST_CLIENT_IP_HEADER", "")
 
 # Nutrient columns mirror Apple HealthKit dietary types so a future
 # Apple Health / Garmin / MyFitnessPal exporter is a plain field copy.
@@ -466,6 +471,23 @@ class LoginIn(BaseModel):
 _login_failures: dict[str, tuple[int, float]] = {}
 
 
+def _client_id(request: Request) -> str:
+    """Кого считать одним клиентом для счётчика попыток.
+
+    Без TRUST_CLIENT_IP_HEADER — адрес сокета. Это верно при прямом доступе и
+    вырождается в общий счётчик за прокси: неприятно (можно заблокировать себя),
+    но безопасно. Доверять заголовку по умолчанию было бы хуже: его подставляет
+    сам клиент, и счётчик обходится сменой значения на каждой попытке.
+    """
+    if TRUST_CLIENT_IP_HEADER:
+        value = request.headers.get(TRUST_CLIENT_IP_HEADER)
+        if value:
+            # X-Forwarded-For — список; наш прокси дописывает адрес клиента
+            # первым слева.
+            return value.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 def _login_blocked(client: str) -> int:
     """Сколько секунд осталось ждать. 0 — можно пробовать."""
     failures, last = _login_failures.get(client, (0, 0.0))
@@ -495,7 +517,7 @@ def login(payload: LoginIn, response: Response, request: Request):
     if not API_KEY:
         raise HTTPException(500, "API key not configured on server")
 
-    client = request.client.host if request.client else "unknown"
+    client = _client_id(request)
     wait = _login_blocked(client)
     if wait:
         raise HTTPException(429, f"Too many attempts, try again in {wait}s")

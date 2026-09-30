@@ -241,3 +241,58 @@ def test_cookie_name_is_the_same_on_write_and_read(anon, insecure_cookies):
     with TestClient(insecure_cookies.app) as fresh:
         fresh.cookies.set(name, token)
         assert fresh.get("/day").status_code == 200
+
+
+# --- счётчик за прокси (§2.6) ------------------------------------------------
+
+
+def test_clients_share_a_bucket_behind_a_proxy_by_default(anon, insecure_cookies):
+    """Без настройки все — один клиент: за туннелем адрес сокета общий.
+
+    Это вырождение, а не поломка: заблокировать можно себя, но счётчик
+    остаётся неподделываемым.
+    """
+    assert insecure_cookies.TRUST_CLIENT_IP_HEADER == "", "по умолчанию заголовку не доверяем"
+    for _ in range(5):
+        login(anon, "wrong")
+    # Другой «клиент» с подставленным заголовком блокировку не обходит
+    resp = anon.post("/auth/login", json={"key": API_KEY}, headers={"CF-Connecting-IP": "10.0.0.7"})
+    assert resp.status_code == 429
+
+
+def test_named_header_separates_clients(anon, insecure_cookies, monkeypatch):
+    monkeypatch.setattr(insecure_cookies, "TRUST_CLIENT_IP_HEADER", "CF-Connecting-IP")
+
+    for _ in range(5):
+        anon.post("/auth/login", json={"key": "wrong"}, headers={"CF-Connecting-IP": "10.0.0.1"})
+
+    blocked = anon.post(
+        "/auth/login", json={"key": "wrong"}, headers={"CF-Connecting-IP": "10.0.0.1"}
+    )
+    assert blocked.status_code == 429, "перебиравший должен быть заблокирован"
+
+    other = anon.post(
+        "/auth/login", json={"key": API_KEY}, headers={"CF-Connecting-IP": "10.0.0.2"}
+    )
+    assert other.status_code == 200, "чужая блокировка не должна мешать входу"
+
+
+def test_forwarded_for_takes_the_leftmost_address(anon, insecure_cookies, monkeypatch):
+    """X-Forwarded-For — список; наш прокси дописывает клиента слева."""
+    monkeypatch.setattr(insecure_cookies, "TRUST_CLIENT_IP_HEADER", "X-Forwarded-For")
+    chain = {"X-Forwarded-For": "10.0.0.1, 172.16.0.1, 192.168.1.1"}
+
+    for _ in range(5):
+        anon.post("/auth/login", json={"key": "wrong"}, headers=chain)
+
+    same = anon.post("/auth/login", json={"key": API_KEY}, headers=chain)
+    assert same.status_code == 429
+
+    # Хвост цепочки тот же — меняется только клиент слева. Если брать адрес
+    # справа, ключом станет общий прокси и разные клиенты сольются в один.
+    other = anon.post(
+        "/auth/login",
+        json={"key": API_KEY},
+        headers={"X-Forwarded-For": "10.0.0.9, 172.16.0.1, 192.168.1.1"},
+    )
+    assert other.status_code == 200, "клиента различает левый адрес, а не прокси справа"

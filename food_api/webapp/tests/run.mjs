@@ -268,6 +268,35 @@ testAsync('успешный ответ обработчик не трогает'
   assert.equal(called, 0);
 });
 
+/* --- работа за префиксом (§2.6) --------------------------------------- */
+
+/** Перечитать api.js с другим baseURI: модули кэшируются, поэтому ?v=. */
+async function apiWithBase(baseURI, tag) {
+  installDom(baseURI);
+  return import(`../api.js?v=${tag}`);
+}
+
+testAsync('база API берётся этажом выше приложения', async () => {
+  const mod = await apiWithBase('http://pi.local/app/', 'plain');
+  assert.equal(mod.API_BASE, 'http://pi.local/');
+});
+
+testAsync('за туннелем с префиксом база сохраняет префикс', async () => {
+  // Публичный доступ идёт как https://<домен>/food/* -> food-api:8000,
+  // то есть приложение отдаётся с /food/app/, а API живёт на /food/.
+  // Зашитый '/' здесь бил бы мимо роутера.
+  const mod = await apiWithBase('https://example.org/food/app/', 'prefixed');
+  assert.equal(mod.API_BASE, 'https://example.org/food/');
+});
+
+testAsync('запросы уходят по вычисленной базе, а не от корня', async () => {
+  const mod = await apiWithBase('https://example.org/food/app/', 'calls');
+  const calls = stubFetch(200, {});
+  mod.setUnauthorizedHandler(() => {});
+  await mod.day();
+  assert.equal(calls[0], 'https://example.org/food/day');
+});
+
 /* --- прогон ---------------------------------------------------------- */
 
 let failed = 0;

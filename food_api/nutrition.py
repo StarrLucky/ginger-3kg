@@ -38,6 +38,13 @@ USDA_DETAIL_URL = "https://api.nal.usda.gov/fdc/v1/food/{fdc_id}"
 OFF_SEARCH_URL = "https://world.openfoodfacts.org/cgi/search.pl"
 USER_AGENT = "MeowFood/1.0 (personal food tracker)"
 
+# Open Food Facts отдаёт 503 «Service Temporarily Unavailable» заметной долей
+# запросов — замерено 2026-10-01: от одного до двух из четырёх подряд. Без
+# повтора позиция уходит в needs_manual с нулями, хотя следующая попытка
+# обычно проходит, и человек заполняет руками то, что справочник знает.
+LOOKUP_RETRIES = 2
+LOOKUP_BACKOFF = 0.5
+
 # nutrientId -> наша колонка. Проверено на живом ответе USDA (SR Legacy 171474).
 # Энергия приходит дважды: 1008 в kcal и 1062 в kJ — берём только kcal.
 # Сахар в части записей лежит под 1063 (Sugars, Total NLEA) вместо 2000.
@@ -178,6 +185,43 @@ def load_overrides(path: str | Path) -> dict[str, dict]:
     return {k.lower(): v for k, v in raw.items() if not k.startswith("_")}
 
 
+async def _get(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    params: dict | None = None,
+    headers: dict | None = None,
+) -> httpx.Response:
+    """GET с повтором на временных отказах справочника.
+
+    Повторяем только то, что имеет шанс измениться само: 5xx, 429 и обрывы
+    связи. 4xx — это наш неверный запрос или ключ, и повтор его не исправит,
+    только задержит ответ пользователю.
+    """
+    delay = LOOKUP_BACKOFF
+    last_error: Exception | None = None
+
+    for attempt in range(LOOKUP_RETRIES + 1):
+        try:
+            resp = await client.get(url, params=params, headers=headers)
+        except httpx.TransportError as err:  # таймауты сюда же, они подкласс
+            last_error = err
+        else:
+            if resp.status_code < 500 and resp.status_code != 429:
+                return resp
+            last_error = None
+            if attempt == LOOKUP_RETRIES:
+                return resp  # пусть решает вызывающий: raise_for_status или пропуск
+
+        if attempt == LOOKUP_RETRIES:
+            break
+        await asyncio.sleep(delay)
+        delay *= 2
+
+    assert last_error is not None
+    raise last_error
+
+
 def _usda_pick_nutrients(detail: dict) -> dict[str, float]:
     """foodNutrients детального ответа -> наши колонки (значения на 100 г)."""
     out: dict[str, float] = {}
@@ -211,7 +255,8 @@ async def usda_lookup(
     сбое USDA. api.data.gov принимает X-Api-Key наравне с ?api_key=.
     """
     headers = {"X-Api-Key": api_key}
-    resp = await client.get(
+    resp = await _get(
+        client,
         USDA_SEARCH_URL,
         params={"query": query, "dataType": "Foundation,SR Legacy", "pageSize": 5},
         headers=headers,
@@ -224,7 +269,7 @@ async def usda_lookup(
         fdc_id = food.get("fdcId")
         if not fdc_id:
             continue
-        detail_resp = await client.get(USDA_DETAIL_URL.format(fdc_id=fdc_id), headers=headers)
+        detail_resp = await _get(client, USDA_DETAIL_URL.format(fdc_id=fdc_id), headers=headers)
         if detail_resp.status_code != 200:
             continue
         detail = detail_resp.json()
@@ -244,7 +289,8 @@ def _off_value(nutriments: dict, key: str, scale: float = 1.0) -> float | None:
 
 async def off_lookup(client: httpx.AsyncClient, query: str) -> tuple[dict, str] | None:
     """Брендовый продукт в Open Food Facts."""
-    resp = await client.get(
+    resp = await _get(
+        client,
         OFF_SEARCH_URL,
         params={
             "search_terms": query,
@@ -315,6 +361,23 @@ async def resolve(
     )
 
 
+def _off_query(item: RecognizedItem, query: str) -> str:
+    """Поисковая строка для Open Food Facts.
+
+    Берём английский lookup_query, а не name: name — на языке пользователя,
+    и «протеиновый пудинг» в базе немецкого продукта не находится ничего.
+    Ровно для этого промпт и просит модель дать запрос по-английски.
+
+    Бренд добавляем, только если его в запросе ещё нет: модель часто включает
+    его сама, и «Ehrmann Ehrmann High Protein» ищется хуже оригинала.
+    """
+    base = query or item.name
+    brand = (item.brand or "").strip()
+    if brand and brand.lower() not in base.lower():
+        return f"{brand} {base}"
+    return base
+
+
 async def _resolve_one(
     item: RecognizedItem,
     conn: sqlite3.Connection,
@@ -351,7 +414,7 @@ async def _resolve_one(
             )
 
     source = "off" if item.kind == "branded" else "usda"
-    off_query = " ".join(filter(None, [item.brand, item.name])) if item.kind == "branded" else query
+    off_query = _off_query(item, query) if item.kind == "branded" else query
     cache_query = off_query if source == "off" else query
 
     # 2. Кэш: гречка ищется один раз в жизни
@@ -367,6 +430,12 @@ async def _resolve_one(
         )
 
     # 3. Внешний справочник
+    if source == "usda" and not usda_api_key:
+        # Без этого USDA отвечает 403 API_KEY_MISSING, и позиция уходила в
+        # manual с текстом «справочник недоступен» — он отправляет искать
+        # проблему в сети, хотя дело в незаполненном окружении.
+        return manual("manual: USDA_API_KEY не задан")
+
     try:
         if source == "off":
             found = await off_lookup(client, off_query)

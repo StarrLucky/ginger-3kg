@@ -276,6 +276,143 @@ async def test_upstream_failure_is_marked_manual(conn):
     assert "недоступен" in res.source_ref
 
 
+async def test_missing_usda_key_says_so_instead_of_blaming_the_network(conn):
+    """USDA на пустой ключ отвечает 403 API_KEY_MISSING.
+
+    Старое сообщение «справочник недоступен» отправляло искать проблему в
+    сети, хотя причина — незаполненное окружение. В сеть при этом не ходим.
+    """
+
+    def boom(request):
+        raise AssertionError("без ключа запрос слать незачем")
+
+    async with mock_client(boom) as client:
+        [res] = await nut.resolve([item()], conn, overrides={}, usda_api_key="", client=client)
+
+    assert res.needs_manual is True
+    assert "USDA_API_KEY" in res.source_ref
+
+
+async def test_missing_usda_key_does_not_block_branded_items(conn):
+    """Брендовое идёт в OFF, которому ключ не нужен."""
+    payload = {"products": [{"product_name": "X", "nutriments": {"energy-kcal_100g": 70}}]}
+    async with mock_client(lambda r: httpx.Response(200, json=payload)) as client:
+        [res] = await nut.resolve(
+            [item(kind="branded", quantity=100)],
+            conn,
+            overrides={},
+            usda_api_key="",
+            client=client,
+        )
+    assert res.needs_manual is False
+    assert res.nutrients["calories_kcal"] == pytest.approx(70)
+
+
+# --- временные отказы справочника --------------------------------------------
+
+
+def flaky(statuses: list[int], ok_payload: dict):
+    """Отдаёт заданные коды по очереди, затем всегда 200 с payload."""
+    calls = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if len(calls) <= len(statuses):
+            return httpx.Response(statuses[len(calls) - 1], json={})
+        return httpx.Response(200, json=ok_payload)
+
+    handle.calls = calls
+    return handle
+
+
+async def test_transient_503_is_retried(conn):
+    """OFF отдаёт 503 заметной долей запросов (замерено на живом API).
+
+    Без повтора позиция уходила в needs_manual с нулями, хотя следующая
+    попытка проходит, и человек заполнял руками то, что справочник знает.
+    """
+    payload = {
+        "products": [
+            {"product_name": "Pudding", "brands": "Ehrmann", "nutriments": {"energy-kcal_100g": 78}}
+        ]
+    }
+    handler = flaky([503, 503], payload)
+
+    async with mock_client(handler) as client:
+        [res] = await nut.resolve(
+            [item(kind="branded", quantity=100)],
+            conn,
+            overrides={},
+            usda_api_key="k",
+            client=client,
+        )
+
+    assert len(handler.calls) == 3, "две неудачи и успех"
+    assert res.needs_manual is False
+    assert res.nutrients["calories_kcal"] == pytest.approx(78)
+
+
+async def test_429_is_retried_too(conn):
+    payload = {"products": [{"product_name": "X", "nutriments": {"energy-kcal_100g": 50}}]}
+    handler = flaky([429], payload)
+    async with mock_client(handler) as client:
+        [res] = await nut.resolve(
+            [item(kind="branded")], conn, overrides={}, usda_api_key="k", client=client
+        )
+    assert len(handler.calls) == 2
+    assert res.needs_manual is False
+
+
+async def test_404_is_not_retried(conn):
+    """4xx — это наш запрос, повтор его не исправит, только задержит ответ."""
+    calls = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(404, json={})
+
+    async with mock_client(handle) as client:
+        [res] = await nut.resolve(
+            [item(kind="branded")], conn, overrides={}, usda_api_key="k", client=client
+        )
+    assert len(calls) == 1, f"404 повторяться не должен, запросов: {len(calls)}"
+    assert res.needs_manual is True
+
+
+async def test_connection_error_is_retried_then_succeeds(conn):
+    attempts = []
+    payload = {"products": [{"product_name": "X", "nutriments": {"energy-kcal_100g": 50}}]}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise httpx.ConnectError("сеть моргнула")
+        return httpx.Response(200, json=payload)
+
+    async with mock_client(handle) as client:
+        [res] = await nut.resolve(
+            [item(kind="branded")], conn, overrides={}, usda_api_key="k", client=client
+        )
+    assert len(attempts) == 2
+    assert res.needs_manual is False
+
+
+async def test_persistent_failure_still_gives_up(conn):
+    """Повтор не должен превращаться в бесконечное ожидание."""
+    calls = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(503, json={})
+
+    async with mock_client(handle) as client:
+        [res] = await nut.resolve(
+            [item(kind="branded")], conn, overrides={}, usda_api_key="k", client=client
+        )
+    assert len(calls) == nut.LOOKUP_RETRIES + 1, "первая попытка плюс повторы, не больше"
+    assert res.needs_manual is True
+
+
 # --- кэш -------------------------------------------------------------------
 
 
@@ -348,7 +485,15 @@ async def test_branded_goes_to_off_with_sodium_scaling(conn):
 
     async with mock_client(handle) as client:
         [res] = await nut.resolve(
-            [item(name="пудинг", kind="branded", brand="Ehrmann", quantity=200)],
+            [
+                item(
+                    name="пудинг",
+                    kind="branded",
+                    brand="Ehrmann",
+                    quantity=200,
+                    lookup_query="high protein pudding",
+                )
+            ],
             conn,
             overrides={},
             usda_api_key="k",
@@ -358,6 +503,86 @@ async def test_branded_goes_to_off_with_sodium_scaling(conn):
     assert res.source_ref == "OFF: Ehrmann High Protein Pudding"
     assert res.nutrients["calories_kcal"] == pytest.approx(156.0)  # 78 * 2
     assert res.nutrients["sodium_mg"] == pytest.approx(160.0)  # 0.08 г -> 80 мг на 100 г, ×2
+
+
+async def test_off_is_searched_in_english_not_the_user_language(conn):
+    """Проверено на живом OFF: «Ehrmann протеиновый пудинг» не находит ничего,
+    «Ehrmann High Protein Pudding» находит товар. Промпт просит английский
+    lookup_query ровно для этого — брать name здесь значит его выбросить."""
+    seen = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.params.get("search_terms", ""))
+        return httpx.Response(
+            200, json={"products": [{"product_name": "X", "nutriments": {"energy-kcal_100g": 70}}]}
+        )
+
+    async with mock_client(handle) as client:
+        await nut.resolve(
+            [
+                item(
+                    name="протеиновый пудинг",
+                    kind="branded",
+                    brand="Ehrmann",
+                    lookup_query="High Protein Pudding",
+                )
+            ],
+            conn,
+            overrides={},
+            usda_api_key="k",
+            client=client,
+        )
+
+    assert seen == ["Ehrmann High Protein Pudding"], seen
+    assert "протеиновый" not in seen[0], "русское название в запрос попадать не должно"
+
+
+async def test_brand_is_not_duplicated_when_already_in_the_query(conn):
+    """Модель часто включает бренд сама; «Ehrmann Ehrmann ...» ищется хуже."""
+    seen = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.params.get("search_terms", ""))
+        return httpx.Response(
+            200, json={"products": [{"product_name": "X", "nutriments": {"energy-kcal_100g": 70}}]}
+        )
+
+    async with mock_client(handle) as client:
+        await nut.resolve(
+            [
+                item(
+                    name="пудинг",
+                    kind="branded",
+                    brand="Ehrmann",
+                    lookup_query="Ehrmann High Protein Pudding",
+                )
+            ],
+            conn,
+            overrides={},
+            usda_api_key="k",
+            client=client,
+        )
+    assert seen == ["Ehrmann High Protein Pudding"], seen
+
+
+async def test_branded_without_lookup_query_falls_back_to_the_name(conn):
+    seen = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.params.get("search_terms", ""))
+        return httpx.Response(
+            200, json={"products": [{"product_name": "X", "nutriments": {"energy-kcal_100g": 70}}]}
+        )
+
+    async with mock_client(handle) as client:
+        await nut.resolve(
+            [item(name="пудинг", kind="branded", brand="Ehrmann", lookup_query="")],
+            conn,
+            overrides={},
+            usda_api_key="k",
+            client=client,
+        )
+    assert seen == ["Ehrmann пудинг"], seen
 
 
 async def test_off_skips_products_without_calories(conn):

@@ -30,6 +30,17 @@ def no_network(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_retry_sleep(monkeypatch):
+    """Повторы в тестах остаются, паузы — нет.
+
+    Иначе каждый тест на недоступный справочник платит реальные 1.5 с.
+    """
+    import nutrition
+
+    monkeypatch.setattr(nutrition, "LOOKUP_BACKOFF", 0)
+
+
+@pytest.fixture(autouse=True)
 def fresh_login_counter():
     """Счётчик неудачных входов живёт в памяти процесса, а не в БД.
 

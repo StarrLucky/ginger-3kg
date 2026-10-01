@@ -30,7 +30,13 @@ log = logging.getLogger(__name__)
 PROMPT_PATH = Path(__file__).with_name("recognize_prompt.md")
 
 DEFAULT_ANTHROPIC_MODEL = "claude-opus-5"
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+# Проверено живым ключом 2026-10-01: gemini-2.5-flash и -lite отвечают 404
+# «no longer available to new users» — то есть на новом ключе дефолт не
+# работал вовсе. Более новая gemini-3.8-flash в тот момент стабильно отдавала
+# 503 «high demand», поэтому дефолт — 3.5-flash: она отвечает. Переопределяется
+# через GEMINI_MODEL, и когда 3.8 перестанет быть перегруженной, её стоит
+# попробовать снова.
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
 DEFAULT_LOCAL_MODEL = "qwen3-vl:8b"
 DEFAULT_LOCAL_URL = "http://localhost:11434/v1/chat/completions"
 

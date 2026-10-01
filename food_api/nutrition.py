@@ -1,12 +1,19 @@
-"""Шаг 2 конвейера: питательность из справочников, без участия LLM.
+"""Шаг 2 конвейера: собрать питательность позиции и отмасштабировать на порцию.
 
-Модель называет еду и оценивает граммовку; числа БЖУ берутся отсюда. Это
-отрезает главный источник галлюцинаций: выдумать значение невозможно, если
-схема ответа модели его не содержит.
+Приоритет источников:
 
-Приоритет источников: overrides.json -> Open Food Facts (брендовое) /
-USDA FoodData Central (generic) -> needs_manual. Ненайденное честно
-помечается, а не заполняется нулями под видом данных.
+1. `overrides.json` — правка человека, последнее слово;
+2. кэш — для брендового по запросу с брендом, для остального по английскому
+   `lookup_query`;
+3. Open Food Facts — только брендовое: там числа с этикетки конкретного
+   продукта, чего модель знать не может;
+4. `per_100g` от модели — основной источник для generic-еды с 2026-10-01
+   (обоснование разворота в WEBAPP.md §1.3++);
+5. `needs_manual` — ненайденное помечается честно, а не заполняется нулями
+   под видом данных.
+
+USDA из рабочего пути убран: поиск сопоставлял «кофе с молоком» с шоколадными
+конфетами. `usda_lookup()` оставлена как базовая линия для замера Фазы 3.
 """
 
 from __future__ import annotations
@@ -44,11 +51,11 @@ USER_AGENT = "MeowFood/1.0 (personal food tracker)"
 # повтора позиция уходит в needs_manual с нулями, хотя следующая попытка
 # обычно проходит, и человек заполняет руками то, что справочник знает.
 LOOKUP_RETRIES = 2
-# Один источник в кэше, ключ — английский lookup_query. Раньше их было два
-# («usda» и «off»), но теперь первичный поставщик чисел один, а ключ общий:
-# одна и та же еда не должна считаться дважды из-за того, что в прошлый раз
-# её назвали брендовой.
-CACHE_SOURCE = "food"
+# Два источника в кэше, а не один. Объединять их нельзя: брендовый пудинг
+# Ehrmann и обобщённый «high protein pudding» — разная еда с разными числами,
+# и под общим ключом второй бренд получал бы этикетку первого.
+SOURCE_REFERENCE = "off"  # ключ включает бренд
+SOURCE_MODEL = "model"  # ключ — английский lookup_query
 
 log = logging.getLogger(__name__)
 LOOKUP_BACKOFF = 0.5
@@ -426,33 +433,46 @@ async def _resolve_one(
             source_ref=source_ref,
         )
 
-    # 2. Кэш по английскому lookup_query — одна еда считается один раз в жизни.
-    #    Он же даёт воспроизводимость: модель может сегодня сказать 126, завтра
-    #    131, и сравнение дней станет шумным. Из кэша число всегда одно и то же.
-    cached = cache_get(conn, CACHE_SOURCE, query)
-    if cached is not None:
-        return resolved(*cached)
-
-    # 3. Брендовое — в Open Food Facts: там числа с этикетки конкретного
-    #    продукта, чего модель знать не может. Неудача не фатальна, ниже есть
-    #    её собственная оценка.
+    # 2. Брендовое — в Open Food Facts: там числа с этикетки конкретного
+    #    продукта, чего модель знать не может.
     if item.kind == "branded":
         off_query = _off_query(item, query)
+
+        # Ключ с брендом, иначе второй пудинг с тем же lookup_query получил бы
+        # этикетку первого.
+        hit = cache_get(conn, SOURCE_REFERENCE, off_query)
+        if hit is not None:
+            return resolved(*hit)
+
         try:
             found = await off_lookup(client, off_query)
         except (httpx.HTTPError, ValueError, KeyError) as exc:
             log.info("OFF недоступен (%s), берём оценку модели", type(exc).__name__)
             found = None
+
         if found is not None:
             per_100g, source_ref = found
-            cache_put(conn, CACHE_SOURCE, query, per_100g, source_ref)
+            cache_put(conn, SOURCE_REFERENCE, off_query, per_100g, source_ref)
             return resolved(per_100g, source_ref)
+
+        # Дальше — оценка модели, но в ячейку справочника она НЕ пишется.
+        # Иначе один отказ OFF (а он отдаёт 503 заметной долей запросов)
+        # навсегда закрепил бы за продуктом догадку вместо данных с этикетки.
+        # Цена решения: пока продукта в OFF нет, его спрашивают при каждой
+        # записи. Для личного трекера это несколько запросов в день.
+
+    # 3. Кэш оценок модели по английскому lookup_query — одна еда считается
+    #    один раз в жизни. Он же даёт воспроизводимость: модель может сегодня
+    #    сказать 126, завтра 131, и сравнение дней станет шумным.
+    cached = cache_get(conn, SOURCE_MODEL, query)
+    if cached is not None:
+        return resolved(*cached)
 
     # 4. Числа модели. Замерено 2026-10-01: на generic-еде они точнее поиска по
     #    USDA, который сопоставлял «кофе с молоком» с шоколадными конфетами.
     if item.per_100g:
         source_ref = f"model: {query}" if query else "model"
-        cache_put(conn, CACHE_SOURCE, query or item.name.lower(), item.per_100g, source_ref)
+        cache_put(conn, SOURCE_MODEL, query or item.name.lower(), item.per_100g, source_ref)
         return resolved(item.per_100g, source_ref)
 
     return manual("manual: ни справочника, ни оценки модели")

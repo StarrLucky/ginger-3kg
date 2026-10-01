@@ -424,6 +424,116 @@ async def test_items_are_resolved_in_parallel(conn):
     assert peak >= 2, f"запросы шли по одному (пик {peak}) — resolve стал последовательным"
 
 
+# --- коллизии в кэше ---------------------------------------------------------
+
+
+def off_product(brand: str, kcal: float):
+    return lambda r: httpx.Response(
+        200,
+        json={
+            "products": [
+                {
+                    "product_name": "High Protein Pudding",
+                    "brands": brand,
+                    "nutriments": {"energy-kcal_100g": kcal},
+                }
+            ]
+        },
+    )
+
+
+async def test_two_brands_with_the_same_query_do_not_share_a_cache_entry(conn):
+    """Модель часто даёт одинаковый lookup_query разным брендам.
+
+    Без бренда в ключе второй продукт получал бы этикетку первого — числа
+    аккуратные, уверенные и чужие.
+    """
+    ehrmann = item(
+        name="пудинг",
+        kind="branded",
+        brand="Ehrmann",
+        lookup_query="high protein pudding",
+        per_100g=dict(MODEL_100G),
+    )
+    mueller = item(
+        name="пудинг",
+        kind="branded",
+        brand="Mueller",
+        lookup_query="high protein pudding",
+        per_100g=dict(MODEL_100G),
+    )
+
+    async with mock_client(off_product("Ehrmann", 78)) as client:
+        [a] = await nut.resolve([ehrmann], conn, overrides={}, client=client)
+    async with mock_client(off_product("Mueller", 120)) as client:
+        [b] = await nut.resolve([mueller], conn, overrides={}, client=client)
+
+    assert a.nutrients["calories_kcal"] == pytest.approx(78)
+    assert b.nutrients["calories_kcal"] == pytest.approx(120), "Mueller получил чужие числа"
+    assert "Mueller" in b.source_ref, b.source_ref
+
+
+async def test_off_outage_does_not_pin_the_product_to_the_model_guess(conn):
+    """OFF отдаёт 503 заметной долей запросов — это не повод терять этикетку.
+
+    Запиши мы оценку модели в ячейку справочника, один отказ закрепил бы
+    догадку навсегда: следующий запрос читал бы её из кэша и в OFF не пошёл.
+    """
+    branded = item(
+        name="пудинг",
+        kind="branded",
+        brand="Ehrmann",
+        lookup_query="high protein pudding",
+        per_100g=dict(MODEL_100G),
+    )
+
+    async with mock_client(lambda r: httpx.Response(503, json={})) as client:
+        [down] = await nut.resolve([branded], conn, overrides={}, client=client)
+    assert down.source_ref.startswith("model:"), "при отказе берём оценку модели"
+
+    calls = []
+
+    def recovered(request):
+        calls.append(1)
+        return off_product("Ehrmann", 78)(request)
+
+    async with mock_client(recovered) as client:
+        [up] = await nut.resolve([branded], conn, overrides={}, client=client)
+
+    assert calls, "после отказа OFF должен быть опрошен снова"
+    assert up.source_ref.startswith("OFF:"), up.source_ref
+    assert up.nutrients["calories_kcal"] == pytest.approx(78)
+
+
+async def test_generic_estimate_does_not_shadow_a_branded_item(conn):
+    """Иначе «брендовое идёт в OFF первым» тихо перестаёт выполняться."""
+    generic = item(
+        name="пудинг",
+        kind="generic",
+        lookup_query="high protein pudding",
+        per_100g=dict(MODEL_100G),
+    )
+    branded = item(
+        name="пудинг",
+        kind="branded",
+        brand="Ehrmann",
+        lookup_query="high protein pudding",
+        per_100g=dict(MODEL_100G),
+    )
+
+    def boom(request):
+        raise AssertionError("generic в сеть ходить не должен")
+
+    async with mock_client(boom) as client:
+        await nut.resolve([generic], conn, overrides={}, client=client)
+
+    async with mock_client(off_product("Ehrmann", 78)) as client:
+        [res] = await nut.resolve([branded], conn, overrides={}, client=client)
+
+    assert res.source_ref.startswith("OFF:"), f"брендовое взяло кэш generic: {res.source_ref}"
+    assert res.nutrients["calories_kcal"] == pytest.approx(78)
+
+
 # --- порядок источников ------------------------------------------------------
 
 

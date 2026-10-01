@@ -70,6 +70,16 @@ def test_nutrition_is_asked_per_100g_not_per_portion():
     assert "not the amount eaten" in prompt
 
 
+def test_prompt_does_not_promise_a_lookup_that_no_longer_happens():
+    """Промпт уходит в модель дословно — это живая инструкция, не комментарий.
+
+    Пока он обещал «generic ищется в USDA», модель готовила lookup_query для
+    базы, которую никто больше не опрашивает.
+    """
+    text = rec.load_prompt() + json.dumps(rec.RECOGNIZE_SCHEMA, ensure_ascii=False)
+    assert "USDA" not in text, "USDA убран из рабочего пути, обещать его нельзя"
+
+
 def test_model_rejects_unknown_field():
     """Поле сбоку от схемы — всё ещё ошибка: extra=forbid на месте."""
     payload = json.loads(json.dumps(MEAL))

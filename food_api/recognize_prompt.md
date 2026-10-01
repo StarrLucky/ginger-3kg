@@ -49,8 +49,10 @@ enough to identify the food.
    `notes` that you did.
 4. **`kind`** — `branded` if the item has a brand or came out of a package
    (йогурт, батончик, творожок, снек, напиток), otherwise `generic` (гречка,
-   курица, яблоко, борщ). This routes the lookup: branded goes to Open Food
-   Facts, generic goes to USDA.
+   курица, яблоко, борщ). This decides where the numbers come from: a branded
+   item is looked up in Open Food Facts, which has the actual label values for
+   that product, and your `per_100g` is the fallback if it is not found. For a
+   generic item your `per_100g` is used directly.
 5. **`brand`** — the brand as printed, when `kind` is `branded`. Null otherwise.
 6. **`lookup_query`** — English, the words a nutrition database would use.
    - generic: the plain ingredient plus the detail that changes the numbers —

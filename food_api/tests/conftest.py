@@ -33,11 +33,14 @@ def no_network(monkeypatch):
 def no_retry_sleep(monkeypatch):
     """Повторы в тестах остаются, паузы — нет.
 
-    Иначе каждый тест на недоступный справочник платит реальные 1.5 с.
+    Иначе каждый тест на недоступный справочник или провайдера платит
+    реальные секунды ожидания.
     """
     import nutrition
+    import recognize
 
     monkeypatch.setattr(nutrition, "LOOKUP_BACKOFF", 0)
+    monkeypatch.setattr(recognize, "TRANSIENT_BACKOFF", 0)
 
 
 @pytest.fixture(autouse=True)

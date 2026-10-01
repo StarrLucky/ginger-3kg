@@ -244,6 +244,21 @@ def test_partial_failure_is_visible_at_the_top_level(client, wire):
     assert [i["needs_manual"] for i in body["draft"]["items"]] == [False, True]
 
 
+def test_rate_limit_reaches_the_client_as_429(client, wire):
+    """Поймано вживую на бесплатном тарифе Gemini.
+
+    502 сказал бы «сломалось» и спровоцировал повтор, который упрётся в тот же
+    лимит. 429 говорит «подожди» — и текст приходит уже человеческим.
+    """
+    wire(error=rec.RecognizeRateLimited("gemini: превышен лимит обращений, попробуй через минуту"))
+    resp = client.post("/recognize", json={"text": "гречка"})
+
+    assert resp.status_code == 429
+    detail = resp.json()["detail"]
+    assert "лимит" in detail
+    assert "://" not in detail, "адрес провайдера пользователю не нужен"
+
+
 def test_model_failure_is_a_502_not_a_500(client, wire):
     """Отказал апстрим, а не мы: клиенту стоит повторить."""
     wire(error=rec.RecognizeError("все провайдеры отказали"))

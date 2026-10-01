@@ -18,6 +18,7 @@ overrides.json правит её навсегда.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -59,10 +60,23 @@ MEAL_TYPES = ("breakfast", "lunch", "dinner", "snack")
 # outputs от этого не спасают, поэтому берём рекомендованные для нестримингового
 # вызова ~16k, а не «сколько кажется достаточным».
 MAX_TOKENS = 16000
+# Временные отказы провайдера: 429 на бесплатном тарифе ловится легко, и через
+# пару секунд запрос обычно проходит. Дольше ждать нельзя — на том конце
+# человек смотрит на индикатор.
+TRANSIENT_RETRIES = 2
+TRANSIENT_BACKOFF = 2.0
 
 
 class RecognizeError(RuntimeError):
     """Провайдер не смог вернуть валидный разбор."""
+
+
+class RecognizeRateLimited(RecognizeError):
+    """Провайдер попросил притормозить.
+
+    Отдельный класс, а не разбор текста ошибки: API отдаёт его клиенту как 429,
+    и тот может сказать «подожди минуту» вместо «что-то пошло не так».
+    """
 
 
 class RecognizeFormatError(RecognizeError):
@@ -391,21 +405,53 @@ class HttpRecognizer(BaseRecognizer):
         params: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """POST с общей обработкой ошибок.
+        """POST с повтором временных отказов и человеческими сообщениями.
 
-        Тело, пришедшее с кодом 200, но не разобравшееся как JSON (HTML-страница
-        от прокси, пустой ответ), — это ошибка формы, а не транспорта: она
-        получает повтор. Отказ сети или 5xx повтора не получает.
+        Повторяем 429, 5xx и обрывы связи — через пару секунд они обычно
+        проходят. 4xx не повторяем: это наш запрос, повтор его не исправит.
+
+        Тело с кодом 200, не разобравшееся как JSON (HTML-страница от прокси,
+        пустой ответ), — ошибка формы: её повторяет BaseRecognizer, добавив
+        текст ошибки в промпт.
+
+        Сообщения не включают URL: в нём нет ничего полезного пользователю, а
+        когда-то там был ключ.
         """
-        try:
-            response = await self.http().post(url, json=json, params=params, headers=headers)
-            response.raise_for_status()
-        except (httpx.HTTPError, httpx.InvalidURL) as err:
-            raise RecognizeError(f"запрос к {url} не удался: {err}") from err
-        try:
-            return response.json()
-        except ValueError as err:
-            raise RecognizeFormatError(f"ответ {url} — не JSON: {err}") from err
+        delay = TRANSIENT_BACKOFF
+
+        for attempt in range(TRANSIENT_RETRIES + 1):
+            last = attempt == TRANSIENT_RETRIES
+            try:
+                response = await self.http().post(url, json=json, params=params, headers=headers)
+            except httpx.InvalidURL as err:
+                raise RecognizeError(f"{self.name}: неверный адрес провайдера") from err
+            except httpx.TransportError as err:  # таймауты тоже сюда
+                if last:
+                    raise RecognizeError(
+                        f"{self.name}: нет связи с провайдером ({type(err).__name__})"
+                    ) from err
+            else:
+                code = response.status_code
+                if code == 429:
+                    if last:
+                        raise RecognizeRateLimited(
+                            f"{self.name}: превышен лимит обращений, попробуй через минуту"
+                        )
+                elif code >= 500:
+                    if last:
+                        raise RecognizeError(f"{self.name}: провайдер недоступен (HTTP {code})")
+                elif code >= 400:
+                    raise RecognizeError(f"{self.name}: запрос отклонён (HTTP {code})")
+                else:
+                    try:
+                        return response.json()
+                    except ValueError as err:
+                        raise RecognizeFormatError(f"{self.name}: ответ не JSON ({err})") from err
+
+            await asyncio.sleep(delay)
+            delay *= 2
+
+        raise AssertionError("недостижимо")  # pragma: no cover
 
 
 class AnthropicRecognizer(BaseRecognizer):

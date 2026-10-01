@@ -685,9 +685,12 @@ async def recognize_meal(payload: RecognizeIn):
             media_type=payload.media_type,
             now=consumed.astimezone(USER_TZ).isoformat(),
         )
+    except rec.RecognizeRateLimited as exc:
+        # 429, а не 502: клиенту нужно не «повторить», а «подождать».
+        raise HTTPException(429, str(exc)) from None
     except rec.RecognizeError as exc:
         # 502, а не 500: отказал апстрим, а не мы. Клиенту стоит повторить.
-        raise HTTPException(502, f"Recognition failed: {exc}") from None
+        raise HTTPException(502, f"Распознавание не удалось: {exc}") from None
 
     # Соединение синхронное и живёт через await'ы лукапов. Запросы к нему
     # короткие и локальные (кэш), event loop они держат на микросекунды.

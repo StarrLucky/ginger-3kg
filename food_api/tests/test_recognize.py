@@ -47,7 +47,12 @@ MEAL = {
 }
 
 
-# --- защита от галлюцинаций ------------------------------------------------
+def local_body(meal: dict) -> dict:
+    """Ответ OpenAI-совместимого эндпоинта (Ollama)."""
+    return {"choices": [{"message": {"content": json.dumps(meal)}}]}
+
+
+# --- форма ответа ----------------------------------------------------------
 
 
 def test_schema_asks_for_every_nutrient():
@@ -266,13 +271,29 @@ async def test_local_sends_image_as_data_url():
     assert content[1]["image_url"]["url"] == "data:image/jpeg;base64,aGk="
 
 
-async def test_http_error_becomes_recognize_error():
+async def test_persistent_server_error_gives_up_with_a_readable_message():
     def handler(request):
         return httpx.Response(500, text="oops")
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    with pytest.raises(rec.RecognizeError, match="не удался"):
+    with pytest.raises(rec.RecognizeError, match="провайдер недоступен"):
         await rec.LocalRecognizer(client=client, prompt=PROMPT).recognize(text="еда")
+
+
+async def test_error_message_carries_no_url():
+    """В адресе нет ничего полезного пользователю, а когда-то там был ключ.
+
+    Код состояния («HTTP 500») остаётся — он помогает понять, что случилось.
+    """
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+    with pytest.raises(rec.RecognizeError) as err:
+        await rec.LocalRecognizer(
+            url="http://secret-host:11434/v1/chat", client=client, prompt=PROMPT
+        ).recognize(text="еда")
+    message = str(err.value)
+    assert "://" not in message, message
+    assert "secret-host" not in message, message
+    assert "HTTP 500" in message, "код состояния стоит оставить"
 
 
 # --- Gemini -----------------------------------------------------------------
@@ -394,16 +415,55 @@ def test_build_rejects_bad_config(env):
         rec.build_recognizer(env)
 
 
-async def test_transport_error_is_not_retried():
-    """Повтор с текстом ошибки лечит форму ответа, а не недоступность сервера."""
+async def test_transient_server_error_is_retried_then_succeeds():
+    """503 через пару секунд обычно проходит — терять из-за него запрос незачем."""
     calls = []
 
     def handler(request):
         calls.append(1)
-        return httpx.Response(503, text="down")
+        if len(calls) == 1:
+            return httpx.Response(503, text="down")
+        return httpx.Response(200, json=local_body(MEAL))
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    with pytest.raises(rec.RecognizeError, match="не удался"):
+    meal = await rec.LocalRecognizer(client=client, prompt=PROMPT).recognize(text="еда")
+    assert len(calls) == 2
+    assert meal.items[0].name == "гречка"
+
+
+async def test_rate_limit_has_its_own_error_type():
+    """API отдаёт его клиенту как 429, чтобы тот сказал «подожди», а не «сломалось».
+
+    Поймано вживую на бесплатном тарифе Gemini: раньше пользователь видел
+    сырой текст с кодом 429 и ссылкой на MDN.
+    """
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(429, text="slow down")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(rec.RecognizeRateLimited, match="лимит"):
+        await rec.LocalRecognizer(client=client, prompt=PROMPT).recognize(text="еда")
+    assert len(calls) == rec.TRANSIENT_RETRIES + 1, "429 должен получить повторы"
+
+
+async def test_rate_limit_is_a_recognize_error_too():
+    """Вызывающие ловят RecognizeError — подкласс не должен проскочить мимо."""
+    assert issubclass(rec.RecognizeRateLimited, rec.RecognizeError)
+
+
+async def test_client_error_is_not_retried():
+    """4xx — это наш запрос, повтор его не исправит, только задержит ответ."""
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(400, text="bad request")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(rec.RecognizeError, match="отклонён"):
         await rec.LocalRecognizer(client=client, prompt=PROMPT).recognize(text="еда")
     assert len(calls) == 1
 

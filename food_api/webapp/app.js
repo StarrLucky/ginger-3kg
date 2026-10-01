@@ -126,6 +126,8 @@ async function recognize() {
     openDraft();
   } catch (err) {
     say($('add-status'), '');
+    // 429 — это «подожди», а не «сломалось»: сообщение приходит с сервера
+    // уже человеческим, показываем как есть.
     say($('add-error'), err.message, 'error');
   } finally {
     button.disabled = false;

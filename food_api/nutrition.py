@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -43,6 +44,13 @@ USER_AGENT = "MeowFood/1.0 (personal food tracker)"
 # повтора позиция уходит в needs_manual с нулями, хотя следующая попытка
 # обычно проходит, и человек заполняет руками то, что справочник знает.
 LOOKUP_RETRIES = 2
+# Один источник в кэше, ключ — английский lookup_query. Раньше их было два
+# («usda» и «off»), но теперь первичный поставщик чисел один, а ключ общий:
+# одна и та же еда не должна считаться дважды из-за того, что в прошлый раз
+# её назвали брендовой.
+CACHE_SOURCE = "food"
+
+log = logging.getLogger(__name__)
 LOOKUP_BACKOFF = 0.5
 
 # nutrientId -> наша колонка. Проверено на живом ответе USDA (SR Legacy 171474).
@@ -81,7 +89,7 @@ _GRAMS_PER_UNIT: dict[str, float] = {
 
 @dataclass
 class RecognizedItem:
-    """То, что вернула модель: еда и количество, но не питательность."""
+    """То, что вернула модель: еда, количество и питательность на 100 г."""
 
     name: str
     quantity: float
@@ -89,6 +97,9 @@ class RecognizedItem:
     kind: Literal["branded", "generic"] = "generic"
     lookup_query: str = ""
     brand: str | None = None
+    # На 100 г, не на порцию: это свойство еды, его можно кэшировать и
+    # масштабировать. None — модель числа не дала (старый вызов или сбой).
+    per_100g: dict[str, float] | None = None
 
 
 @dataclass
@@ -334,7 +345,6 @@ async def resolve(
     conn: sqlite3.Connection,
     *,
     overrides: dict[str, dict],
-    usda_api_key: str,
     client: httpx.AsyncClient,
 ) -> list[ResolvedItem]:
     """Проставить БЖУ каждой позиции из справочников.
@@ -351,12 +361,7 @@ async def resolve(
     """
     return list(
         await asyncio.gather(
-            *(
-                _resolve_one(
-                    item, conn, overrides=overrides, usda_api_key=usda_api_key, client=client
-                )
-                for item in items
-            )
+            *(_resolve_one(item, conn, overrides=overrides, client=client) for item in items)
         )
     )
 
@@ -383,7 +388,6 @@ async def _resolve_one(
     conn: sqlite3.Connection,
     *,
     overrides: dict[str, dict],
-    usda_api_key: str,
     client: httpx.AsyncClient,
 ) -> ResolvedItem:
     grams = to_grams(item.quantity, item.unit)
@@ -413,14 +417,7 @@ async def _resolve_one(
                 source_ref="override",
             )
 
-    source = "off" if item.kind == "branded" else "usda"
-    off_query = _off_query(item, query) if item.kind == "branded" else query
-    cache_query = off_query if source == "off" else query
-
-    # 2. Кэш: гречка ищется один раз в жизни
-    cached = cache_get(conn, source, cache_query)
-    if cached is not None:
-        per_100g, source_ref = cached
+    def resolved(per_100g: dict, source_ref: str) -> ResolvedItem:
         return ResolvedItem(
             name=item.name,
             quantity=item.quantity,
@@ -429,30 +426,33 @@ async def _resolve_one(
             source_ref=source_ref,
         )
 
-    # 3. Внешний справочник
-    if source == "usda" and not usda_api_key:
-        # Без этого USDA отвечает 403 API_KEY_MISSING, и позиция уходила в
-        # manual с текстом «справочник недоступен» — он отправляет искать
-        # проблему в сети, хотя дело в незаполненном окружении.
-        return manual("manual: USDA_API_KEY не задан")
+    # 2. Кэш по английскому lookup_query — одна еда считается один раз в жизни.
+    #    Он же даёт воспроизводимость: модель может сегодня сказать 126, завтра
+    #    131, и сравнение дней станет шумным. Из кэша число всегда одно и то же.
+    cached = cache_get(conn, CACHE_SOURCE, query)
+    if cached is not None:
+        return resolved(*cached)
 
-    try:
-        if source == "off":
+    # 3. Брендовое — в Open Food Facts: там числа с этикетки конкретного
+    #    продукта, чего модель знать не может. Неудача не фатальна, ниже есть
+    #    её собственная оценка.
+    if item.kind == "branded":
+        off_query = _off_query(item, query)
+        try:
             found = await off_lookup(client, off_query)
-        else:
-            found = await usda_lookup(client, query, usda_api_key)
-    except (httpx.HTTPError, ValueError, KeyError) as exc:
-        return manual(f"manual: справочник недоступен ({type(exc).__name__})")
+        except (httpx.HTTPError, ValueError, KeyError) as exc:
+            log.info("OFF недоступен (%s), берём оценку модели", type(exc).__name__)
+            found = None
+        if found is not None:
+            per_100g, source_ref = found
+            cache_put(conn, CACHE_SOURCE, query, per_100g, source_ref)
+            return resolved(per_100g, source_ref)
 
-    if found is None:
-        return manual("manual: не найдено в справочнике")
+    # 4. Числа модели. Замерено 2026-10-01: на generic-еде они точнее поиска по
+    #    USDA, который сопоставлял «кофе с молоком» с шоколадными конфетами.
+    if item.per_100g:
+        source_ref = f"model: {query}" if query else "model"
+        cache_put(conn, CACHE_SOURCE, query or item.name.lower(), item.per_100g, source_ref)
+        return resolved(item.per_100g, source_ref)
 
-    per_100g, source_ref = found
-    cache_put(conn, source, cache_query, per_100g, source_ref)
-    return ResolvedItem(
-        name=item.name,
-        quantity=item.quantity,
-        unit=item.unit,
-        nutrients=scale_per_100g(per_100g, grams),
-        source_ref=source_ref,
-    )
+    return manual("manual: ни справочника, ни оценки модели")

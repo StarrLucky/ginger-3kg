@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 import httpx
-from nutrition import RecognizedItem
+from nutrition import NUTRIENT_KEYS, RecognizedItem
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 log = logging.getLogger(__name__)
@@ -68,8 +68,41 @@ class RecognizeFormatError(RecognizeError):
     """
 
 
+class Per100g(BaseModel):
+    """Питательность на 100 г продукта — не на съеденную порцию.
+
+    На 100 г, потому что это свойство еды, а не приёма пищи: его можно
+    закэшировать по lookup_query и отмасштабировать арифметикой. Попроси мы
+    сумму на порцию — кэш стал бы бесполезен (каждая порция своя), а модель
+    считала бы умножение, в котором ошибаются чаще, чем в самих значениях.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    calories_kcal: float
+    protein_g: float
+    fat_total_g: float
+    fat_saturated_g: float
+    carbs_g: float
+    fiber_g: float
+    sugar_g: float
+    sodium_mg: float
+    caffeine_mg: float
+
+    @field_validator("*")
+    @classmethod
+    def _no_negatives(cls, value: float) -> float:
+        """Отрицательных макросов не бывает.
+
+        Схема structured outputs не умеет minimum, так что отсечь можно только
+        здесь. Подрезаем, а не отвергаем: одно странное поле не повод терять
+        весь разбор.
+        """
+        return max(0.0, value)
+
+
 class RecognizedItemOut(BaseModel):
-    """Одна позиция в ответе модели. Полей питательности здесь нет намеренно."""
+    """Одна позиция в ответе модели."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -79,6 +112,7 @@ class RecognizedItemOut(BaseModel):
     kind: Literal["branded", "generic"]
     lookup_query: str = Field(min_length=1)
     brand: str | None = None
+    per_100g: Per100g
 
 
 class RecognizedMeal(BaseModel):
@@ -112,6 +146,7 @@ class RecognizedMeal(BaseModel):
                 kind=item.kind,
                 lookup_query=item.lookup_query,
                 brand=item.brand,
+                per_100g=item.per_100g.model_dump(),
             )
             for item in self.items
         ]
@@ -134,8 +169,23 @@ RECOGNIZE_SCHEMA: dict[str, Any] = {
                     "kind": {"type": "string", "enum": ["branded", "generic"]},
                     "lookup_query": {"type": "string", "description": "English, for USDA/OFF"},
                     "brand": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    "per_100g": {
+                        "type": "object",
+                        "description": "Per 100 g of the food as prepared, not per portion",
+                        "properties": {key: {"type": "number"} for key in NUTRIENT_KEYS},
+                        "required": list(NUTRIENT_KEYS),
+                        "additionalProperties": False,
+                    },
                 },
-                "required": ["name", "quantity", "unit", "kind", "lookup_query", "brand"],
+                "required": [
+                    "name",
+                    "quantity",
+                    "unit",
+                    "kind",
+                    "lookup_query",
+                    "brand",
+                    "per_100g",
+                ],
                 "additionalProperties": False,
             },
         },

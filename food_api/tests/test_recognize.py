@@ -1,8 +1,8 @@
 """Шаг 1: распознавание.
 
 Главное здесь — не «модель вернула правильную еду» (это работа eval из Фазы 3),
-а что схема ответа не даёт вернуть БЖУ. Это и есть защита от галлюцинаций,
-поэтому она закреплена тестом, а не только комментарием в коде.
+а форма ответа: питательность приходит **на 100 г**, а не на порцию. От этого
+зависит и кэш, и масштабирование, и возможность поправить число один раз.
 
 Сеть замокана фикстурой no_network; клиенты подменяются целиком.
 """
@@ -17,6 +17,18 @@ import recognize as rec
 
 PROMPT = "тестовый промпт"
 
+PER_100G = {
+    "calories_kcal": 92.0,
+    "protein_g": 3.4,
+    "fat_total_g": 0.6,
+    "fat_saturated_g": 0.1,
+    "carbs_g": 19.9,
+    "fiber_g": 2.7,
+    "sugar_g": 0.9,
+    "sodium_mg": 4.0,
+    "caffeine_mg": 0.0,
+}
+
 MEAL = {
     "items": [
         {
@@ -26,6 +38,7 @@ MEAL = {
             "kind": "generic",
             "lookup_query": "buckwheat groats, cooked",
             "brand": None,
+            "per_100g": dict(PER_100G),
         }
     ],
     "meal_type": "lunch",
@@ -37,24 +50,40 @@ MEAL = {
 # --- защита от галлюцинаций ------------------------------------------------
 
 
-def test_schema_has_no_nutrition_fields():
-    """Ни одного поля питательности в схеме — выдумать число некуда."""
-    blob = json.dumps(rec.RECOGNIZE_SCHEMA)
-    for key in nut.NUTRIENT_KEYS:
-        assert key not in blob
+def test_schema_asks_for_every_nutrient():
+    """Все девять колонок обязательны: недостающую потом нечем заполнить."""
+    per_100g = rec.RECOGNIZE_SCHEMA["properties"]["items"]["items"]["properties"]["per_100g"]
+    assert set(per_100g["properties"]) == set(nut.NUTRIENT_KEYS)
+    assert set(per_100g["required"]) == set(nut.NUTRIENT_KEYS)
+    assert per_100g["additionalProperties"] is False
 
 
-def test_model_rejects_nutrition_field():
-    """Даже если модель припишет калории сбоку, extra=forbid это отвергнет."""
+def test_nutrition_is_asked_per_100g_not_per_portion():
+    """От этого зависит всё остальное: кэш, масштабирование, правка значения.
+
+    Сумма на порцию не переиспользуется для другого веса и заставляет модель
+    умножать — а в умножении ошибаются чаще, чем в самих значениях.
+    """
+    assert "per_100g" in rec.RECOGNIZE_SCHEMA["properties"]["items"]["items"]["properties"]
+    prompt = rec.load_prompt().lower()
+    assert "per 100 g, never per portion" in prompt
+    assert "not the amount eaten" in prompt
+
+
+def test_model_rejects_unknown_field():
+    """Поле сбоку от схемы — всё ещё ошибка: extra=forbid на месте."""
     payload = json.loads(json.dumps(MEAL))
-    payload["items"][0]["calories_kcal"] = 620
+    payload["items"][0]["glycemic_index"] = 54
     with pytest.raises(rec.RecognizeError, match="валидацию"):
         rec.validate(payload)
 
 
-def test_prompt_forbids_nutrition_numbers():
-    """Промпт на диске не должен снова начать просить БЖУ."""
-    assert "do not return nutrition numbers" in rec.load_prompt().lower()
+@pytest.mark.parametrize("given,expected", [(-5.0, 0.0), (0.0, 0.0), (12.5, 12.5)])
+def test_negative_macros_are_clamped(given, expected):
+    """Схема не умеет minimum; отрицательный белок не повод терять весь разбор."""
+    payload = json.loads(json.dumps(MEAL))
+    payload["items"][0]["per_100g"]["protein_g"] = given
+    assert rec.validate(payload).items[0].per_100g.protein_g == expected
 
 
 def test_schema_matches_model():
@@ -63,6 +92,9 @@ def test_schema_matches_model():
     item_schema = rec.RECOGNIZE_SCHEMA["properties"]["items"]["items"]
     assert set(item_schema["properties"]) == set(rec.RecognizedItemOut.model_fields)
     assert item_schema["additionalProperties"] is False
+
+    per_100g = item_schema["properties"]["per_100g"]
+    assert set(per_100g["properties"]) == set(rec.Per100g.model_fields)
 
 
 # --- валидация и перевод в шаг 2 -------------------------------------------

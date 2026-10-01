@@ -11,6 +11,33 @@ import recognize as rec
 
 FULL_PANEL = {1008: ("kcal", 343.0), 1003: ("g", 13.25), 1004: ("g", 3.4), 1005: ("g", 71.5)}
 
+# Числа модели на 100 г — с 2026-10-01 основной источник для generic-еды.
+PER_100G = {
+    "calories_kcal": 92.0,
+    "protein_g": 3.4,
+    "fat_total_g": 0.6,
+    "fat_saturated_g": 0.1,
+    "carbs_g": 19.9,
+    "fiber_g": 2.7,
+    "sugar_g": 0.9,
+    "sodium_mg": 4.0,
+    "caffeine_mg": 0.0,
+}
+
+
+def out_item(**kw) -> rec.RecognizedItemOut:
+    base = {
+        "name": "гречка",
+        "quantity": 180,
+        "unit": "g",
+        "kind": "generic",
+        "lookup_query": "buckwheat, cooked",
+        "brand": None,
+        "per_100g": dict(PER_100G),
+    }
+    base.update(kw)
+    return rec.RecognizedItemOut(**base)
+
 
 class FakeRecognizer:
     """Заглушка шага 1: отдаёт заранее заданный разбор или падает."""
@@ -35,16 +62,7 @@ class FakeRecognizer:
 
 def meal(items=None, meal_type="lunch", notes="", confidence=0.8) -> rec.RecognizedMeal:
     if items is None:
-        items = [
-            rec.RecognizedItemOut(
-                name="гречка",
-                quantity=180,
-                unit="g",
-                kind="generic",
-                lookup_query="buckwheat, cooked",
-                brand=None,
-            )
-        ]
+        items = [out_item()]
     return rec.RecognizedMeal(items=items, meal_type=meal_type, notes=notes, confidence=confidence)
 
 
@@ -65,9 +83,8 @@ def usda_ok(request: httpx.Request) -> httpx.Response:
 
 
 @pytest.fixture
-def wire(client, api, monkeypatch):
+def wire(client, api):
     """Подменить распознаватель и сетевой клиент у уже поднятого приложения."""
-    monkeypatch.setattr(api, "USDA_API_KEY", "test-usda-key")
 
     def _wire(*, meal=None, error=None, handler=usda_ok):
         fake = FakeRecognizer(meal, error)
@@ -117,13 +134,30 @@ def test_draft_is_accepted_by_logs_unchanged(client, wire):
     assert saved.json()["items_saved"] == 1
 
 
-def test_macros_come_from_the_reference_not_the_model(client, wire):
+def test_macros_are_scaled_from_the_model_numbers(client, wire):
+    """Изменено 2026-10-01: раньше числа брались из USDA.
+
+    Поиск по USDA сопоставлял «кофе с молоком» с шоколадными конфетами —
+    1098 ккал вместо ~45. Модель на generic-еде оказалась точнее, а её числа
+    приходят на 100 г, поэтому масштабирование остаётся на сервере.
+    """
     wire(meal=meal())
     [item] = client.post("/recognize", json={"text": "180 г гречки"}).json()["draft"]["items"]
 
-    assert item["calories_kcal"] == pytest.approx(617.4)  # 343 * 1.8
-    assert item["source_ref"].startswith("USDA 170286")
+    assert item["calories_kcal"] == pytest.approx(165.6)  # 92 на 100 г * 1.8
+    assert item["protein_g"] == pytest.approx(6.1)  # 3.4 * 1.8, округлено до 0.1
+    assert item["source_ref"].startswith("model:"), item["source_ref"]
     assert item["needs_manual"] is False
+
+
+def test_the_same_food_twice_costs_one_lookup(client, wire):
+    """Кэш по lookup_query: второй раз числа берутся из базы, не у модели."""
+    wire(meal=meal())
+    first = client.post("/recognize", json={"text": "180 г гречки"}).json()["draft"]["items"][0]
+    second = client.post("/recognize", json={"text": "180 г гречки"}).json()["draft"]["items"][0]
+
+    assert first["calories_kcal"] == second["calories_kcal"]
+    assert first["source_ref"] == second["source_ref"]
 
 
 def test_recognize_saves_nothing(client, wire, api):
@@ -183,16 +217,7 @@ def test_unresolved_item_is_flagged_not_zeroed_silently(client, wire):
     """Штуки в граммы не переводятся — позиция уходит в ручной ввод."""
     wire(
         meal=meal(
-            items=[
-                rec.RecognizedItemOut(
-                    name="сырник",
-                    quantity=2,
-                    unit="шт",
-                    kind="generic",
-                    lookup_query="cheese pancake",
-                    brand=None,
-                )
-            ]
+            items=[out_item(name="сырник", quantity=2, unit="шт", lookup_query="cheese pancake")]
         )
     )
     body = client.post("/recognize", json={"text": "два сырника"}).json()
@@ -208,22 +233,8 @@ def test_partial_failure_is_visible_at_the_top_level(client, wire):
     wire(
         meal=meal(
             items=[
-                rec.RecognizedItemOut(
-                    name="гречка",
-                    quantity=180,
-                    unit="g",
-                    kind="generic",
-                    lookup_query="buckwheat",
-                    brand=None,
-                ),
-                rec.RecognizedItemOut(
-                    name="сырник",
-                    quantity=2,
-                    unit="шт",
-                    kind="generic",
-                    lookup_query="cheese pancake",
-                    brand=None,
-                ),
+                out_item(lookup_query="buckwheat"),
+                out_item(name="сырник", quantity=2, unit="шт", lookup_query="cheese pancake"),
             ]
         )
     )

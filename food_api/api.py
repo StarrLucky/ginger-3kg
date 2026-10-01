@@ -53,7 +53,6 @@ app = FastAPI(title="Meow Food API", version="1.0.0", lifespan=lifespan)
 DB_PATH = os.getenv("DB_PATH", "data/food.db")
 API_KEY = os.getenv("FOOD_API_KEY", "")
 USER_TZ = ZoneInfo(os.getenv("USER_TIMEZONE", "UTC"))
-USDA_API_KEY = os.getenv("USDA_API_KEY", "")
 OVERRIDES_PATH = Path(__file__).parent / "overrides.json"
 WEBAPP_DIR = Path(__file__).parent / "webapp"
 # Лукап в справочник — два коротких запроса подряд; если USDA молчит полминуты,
@@ -698,7 +697,6 @@ async def recognize_meal(payload: RecognizeIn):
             meal.to_items(),
             conn,
             overrides=app.state.overrides,
-            usda_api_key=USDA_API_KEY,
             client=app.state.http,
         )
     finally:

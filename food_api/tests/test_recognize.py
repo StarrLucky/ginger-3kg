@@ -296,6 +296,38 @@ async def test_error_message_carries_no_url():
     assert "HTTP 500" in message, "код состояния стоит оставить"
 
 
+def test_chain_can_name_a_model_per_entry():
+    """Квота бесплатного тарифа Gemini — 20 запросов в сутки НА МОДЕЛЬ.
+
+    Перебор нескольких моделей одного провайдера и есть способ прожить день;
+    без этого все элементы gemini брали бы GEMINI_MODEL и упирались в одну
+    и ту же квоту.
+    """
+    chain = rec.build_recognizer(
+        {
+            "RECOGNIZE_PROVIDER": "gemini:gemini-3.5-flash-lite,gemini:gemini-3.6-flash",
+            "GEMINI_API_KEY": "not-a-real-key",
+        }
+    )
+    assert [r.model for r in chain.recognizers] == ["gemini-3.5-flash-lite", "gemini-3.6-flash"]
+
+
+def test_entry_without_a_model_falls_back_to_the_env():
+    chain = rec.build_recognizer(
+        {
+            "RECOGNIZE_PROVIDER": "gemini,gemini:gemini-3.6-flash",
+            "GEMINI_API_KEY": "not-a-real-key",
+            "GEMINI_MODEL": "gemini-3.5-flash",
+        }
+    )
+    assert [r.model for r in chain.recognizers] == ["gemini-3.5-flash", "gemini-3.6-flash"]
+
+
+def test_unknown_provider_is_still_rejected_with_a_model_suffix():
+    with pytest.raises(ValueError, match="нетакого"):
+        rec.build_recognizer({"RECOGNIZE_PROVIDER": "нетакого:модель"})
+
+
 # --- Gemini -----------------------------------------------------------------
 
 

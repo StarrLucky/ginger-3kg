@@ -736,28 +736,30 @@ class FallbackRecognizer:
             await recognizer.aclose()
 
 
-def _build_anthropic(env: dict[str, str]) -> Recognizer:
+def _build_anthropic(env: dict[str, str], model: str | None) -> Recognizer:
     if not env.get("ANTHROPIC_API_KEY"):
         # Не ошибка: SDK умеет брать учётку и из профиля `ant auth login`.
         # Но на Pi профиля нет, и молчать об этом до первого фото не стоит.
         log.warning("ANTHROPIC_API_KEY не задан — SDK будет искать учётку сам")
     return AnthropicRecognizer(
-        model=env.get("RECOGNIZE_MODEL") or DEFAULT_ANTHROPIC_MODEL,
+        model=model or env.get("RECOGNIZE_MODEL") or DEFAULT_ANTHROPIC_MODEL,
         api_key=env.get("ANTHROPIC_API_KEY"),
     )
 
 
-def _build_gemini(env: dict[str, str]) -> Recognizer:
+def _build_gemini(env: dict[str, str], model: str | None) -> Recognizer:
     key = env.get("GEMINI_API_KEY")
     if not key:
         raise ValueError("RECOGNIZE_PROVIDER=gemini, но GEMINI_API_KEY не задан")
-    return GeminiRecognizer(api_key=key, model=env.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL)
+    return GeminiRecognizer(
+        api_key=key, model=model or env.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL
+    )
 
 
-def _build_local(env: dict[str, str]) -> Recognizer:
+def _build_local(env: dict[str, str], model: str | None) -> Recognizer:
     return LocalRecognizer(
         url=env.get("LOCAL_LLM_URL") or DEFAULT_LOCAL_URL,
-        model=env.get("LOCAL_LLM_MODEL") or DEFAULT_LOCAL_MODEL,
+        model=model or env.get("LOCAL_LLM_MODEL") or DEFAULT_LOCAL_MODEL,
     )
 
 
@@ -767,16 +769,27 @@ _BUILDERS = {"anthropic": _build_anthropic, "gemini": _build_gemini, "local": _b
 def build_recognizer(env: dict[str, str] | None = None) -> Recognizer:
     """Собрать распознаватель по окружению.
 
-    RECOGNIZE_PROVIDER — имя или список через запятую (`anthropic,local`):
-    порядок и есть порядок фолбэка, без неявных правил.
+    RECOGNIZE_PROVIDER — список через запятую, порядок и есть порядок фолбэка:
+    `anthropic,local`. У элемента можно указать модель через двоеточие:
+    `gemini:gemini-3.5-flash-lite,gemini:gemini-3.6-flash`.
+
+    Модель в элементе нужна не для красоты. Квота бесплатного тарифа Gemini —
+    20 запросов в сутки **на модель**, поэтому перебор нескольких моделей
+    одного провайдера и есть способ прожить день. Без этого синтаксиса все
+    элементы `gemini` брали бы одну и ту же модель из GEMINI_MODEL и упирались
+    бы в одну и ту же квоту.
     """
     env = dict(os.environ) if env is None else env
-    names = [n.strip() for n in env.get("RECOGNIZE_PROVIDER", "anthropic").split(",") if n.strip()]
-    if not names:
+    raw = [n.strip() for n in env.get("RECOGNIZE_PROVIDER", "anthropic").split(",") if n.strip()]
+    if not raw:
         raise ValueError("RECOGNIZE_PROVIDER пуст")
-    unknown = [n for n in names if n not in _BUILDERS]
-    if unknown:
-        raise ValueError(f"неизвестный провайдер: {', '.join(unknown)}")
 
-    chain = [_BUILDERS[name](env) for name in names]
+    chain = []
+    for entry in raw:
+        name, _, model = entry.partition(":")
+        name, model = name.strip(), model.strip() or None
+        if name not in _BUILDERS:
+            raise ValueError(f"неизвестный провайдер: {name}")
+        chain.append(_BUILDERS[name](env, model))
+
     return chain[0] if len(chain) == 1 else FallbackRecognizer(chain)

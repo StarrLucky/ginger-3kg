@@ -431,6 +431,85 @@ async def test_transient_server_error_is_retried_then_succeeds():
     assert meal.items[0].name == "гречка"
 
 
+GOOGLE_DAILY_QUOTA = {
+    "error": {
+        "code": 429,
+        "message": "You exceeded your current quota",
+        "details": [
+            {
+                "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                "violations": [
+                    {
+                        "quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+                        "quotaValue": "20",
+                    }
+                ],
+            },
+            {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "40s"},
+        ],
+    }
+}
+
+GOOGLE_THROTTLE = {
+    "error": {
+        "code": 429,
+        "details": [
+            {
+                "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                "violations": [{"quotaId": "GenerateRequestsPerMinutePerProject-FreeTier"}],
+            },
+            {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "7s"},
+        ],
+    }
+}
+
+
+async def test_daily_quota_is_not_retried():
+    """Замерено на живом ключе: бесплатный тариф Gemini — 20 запросов В СУТКИ.
+
+    Повторять бессмысленно: до завтра ничего не изменится, а три попытки
+    только жгут время человека, который смотрит на индикатор.
+    """
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(429, json=GOOGLE_DAILY_QUOTA)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(rec.RecognizeRateLimited, match="суточная квота") as err:
+        await rec.LocalRecognizer(client=client, prompt=PROMPT).recognize(text="еда")
+
+    assert len(calls) == 1, "суточную квоту повторять незачем"
+    assert err.value.retry_after is None
+    assert "минуту" not in str(err.value), "сообщать про минуту было бы враньём"
+
+
+async def test_throttling_is_retried_and_reports_the_delay():
+    """Минутный лимит — другое дело: повтор уместен, задержку берём у провайдера."""
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(429, json=GOOGLE_THROTTLE)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(rec.RecognizeRateLimited, match="через 7 с") as err:
+        await rec.LocalRecognizer(client=client, prompt=PROMPT).recognize(text="еда")
+
+    assert len(calls) == rec.TRANSIENT_RETRIES + 1
+    assert err.value.retry_after == 7.0
+
+
+async def test_unparseable_429_still_gives_a_sane_message():
+    """У другого провайдера форма своя — общий текст лучше падения."""
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(429, text="slow down"))
+    )
+    with pytest.raises(rec.RecognizeRateLimited, match="лимит обращений"):
+        await rec.LocalRecognizer(client=client, prompt=PROMPT).recognize(text="еда")
+
+
 async def test_rate_limit_has_its_own_error_type():
     """API отдаёт его клиенту как 429, чтобы тот сказал «подожди», а не «сломалось».
 
@@ -446,7 +525,7 @@ async def test_rate_limit_has_its_own_error_type():
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     with pytest.raises(rec.RecognizeRateLimited, match="лимит"):
         await rec.LocalRecognizer(client=client, prompt=PROMPT).recognize(text="еда")
-    assert len(calls) == rec.TRANSIENT_RETRIES + 1, "429 должен получить повторы"
+    assert len(calls) == rec.TRANSIENT_RETRIES + 1, "429 без разбора считаем троттлингом"
 
 
 async def test_rate_limit_is_a_recognize_error_too():

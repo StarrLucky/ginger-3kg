@@ -75,8 +75,47 @@ class RecognizeRateLimited(RecognizeError):
     """Провайдер попросил притормозить.
 
     Отдельный класс, а не разбор текста ошибки: API отдаёт его клиенту как 429,
-    и тот может сказать «подожди минуту» вместо «что-то пошло не так».
+    и тот может сказать «подожди», а не «что-то пошло не так».
+
+    `retry_after` — через сколько секунд повтор имеет смысл. None означает, что
+    ждать бесполезно: исчерпана суточная квота, и до завтра ничего не изменится.
     """
+
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _parse_rate_limit(name: str, response: httpx.Response) -> RecognizeRateLimited:
+    """Разобрать 429 в осмысленную ошибку.
+
+    Замерено 2026-10-01 на Gemini: бесплатный тариф даёт 20 запросов **в сутки**
+    на модель, и сообщение «попробуй через минуту» было прямым враньём — ждать
+    надо до завтра. Разница практическая: в одном случае повтор уместен, в
+    другом он только жжёт время.
+    """
+    quota_id = ""
+    retry_after: float | None = None
+    try:
+        details = response.json().get("error", {}).get("details", [])
+        for detail in details:
+            for violation in detail.get("violations", []):
+                quota_id = violation.get("quotaId", "") or quota_id
+            delay = detail.get("retryDelay")
+            if isinstance(delay, str) and delay.endswith("s"):
+                retry_after = float(delay[:-1])
+    except (ValueError, TypeError, AttributeError):
+        pass  # у другого провайдера форма своя — обойдёмся общим текстом
+
+    if "PerDay" in quota_id:
+        return RecognizeRateLimited(
+            f"{name}: суточная квота исчерпана, до завтра запросы не пройдут", None
+        )
+    if retry_after:
+        return RecognizeRateLimited(
+            f"{name}: слишком часто, попробуй через {int(retry_after)} с", retry_after
+        )
+    return RecognizeRateLimited(f"{name}: превышен лимит обращений, попробуй позже", 60.0)
 
 
 class RecognizeFormatError(RecognizeError):
@@ -433,10 +472,12 @@ class HttpRecognizer(BaseRecognizer):
             else:
                 code = response.status_code
                 if code == 429:
-                    if last:
-                        raise RecognizeRateLimited(
-                            f"{self.name}: превышен лимит обращений, попробуй через минуту"
-                        )
+                    limited = _parse_rate_limit(self.name, response)
+                    # Суточную квоту повторять бессмысленно: до завтра ничего
+                    # не изменится, а три попытки только жгут время человека,
+                    # который смотрит на индикатор.
+                    if limited.retry_after is None or last:
+                        raise limited
                 elif code >= 500:
                     if last:
                         raise RecognizeError(f"{self.name}: провайдер недоступен (HTTP {code})")
